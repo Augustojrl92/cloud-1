@@ -45,3 +45,52 @@ resource "google_compute_instance" "cloud1_vm" {
   # para indicar que dichas reglas se aplican únicamente a esta máquina.
   tags = ["cloud1"]
 }
+
+# Regla de firewall para permitir acceso SSH.
+resource "google_compute_firewall" "allow_ssh" {
+  name    = "cloud1-allow-ssh"
+  network = "default"
+
+  # Permite conexiones TCP por el puerto 22.
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  # Permite conexiones desde cualquier IP de Internet.
+  # Para el proyecto lo dejamos así de momento.
+  source_ranges = ["0.0.0.0/0"]
+
+  # Esta regla solo se aplica a las VMs que tengan la etiqueta "cloud1".
+  target_tags = ["cloud1"]
+}
+
+# Regla de firewall para permitir tráfico HTTP.
+resource "google_compute_firewall" "allow_http" {
+  name    = "cloud1-allow-http"
+  network = "default"
+
+  # Puerto estándar HTTP.
+  allow {
+    protocol = "tcp"
+    ports    = ["80"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["cloud1"]
+}
+
+# Regla de firewall para permitir tráfico HTTPS.
+resource "google_compute_firewall" "allow_https" {
+  name    = "cloud1-allow-https"
+  network = "default"
+
+  # Puerto estándar HTTPS/TLS.
+  allow {
+    protocol = "tcp"
+    ports    = ["443"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["cloud1"]
+}

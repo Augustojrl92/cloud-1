@@ -1,0 +1,8 @@
+---
+
+- name: Configuracion de Cloud-1
+  hosts: cloud
+  become: true
+
+  roles:
+    - docker
