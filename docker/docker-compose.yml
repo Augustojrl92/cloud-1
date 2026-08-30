@@ -1,0 +1,91 @@
+services:
+  # Base de datos de WordPress.
+  mariadb:
+    image: mariadb:11
+    container_name: cloud1_mariadb
+    restart: unless-stopped
+
+    environment:
+      MARIADB_ROOT_PASSWORD: root_password_temporal
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress_user
+      MARIADB_PASSWORD: wordpress_password_temporal
+
+    # Guarda los datos de MariaDB de forma persistente.
+    volumes:
+      - mariadb_data:/var/lib/mysql
+
+    networks:
+      - cloud1_network
+
+  # Aplicación WordPress conectada a MariaDB.
+  wordpress:
+    image: wordpress:latest
+    container_name: cloud1_wordpress
+
+    restart: unless-stopped
+
+    environment:
+      WORDPRESS_DB_HOST: mariadb:3306
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress_user
+      WORDPRESS_DB_PASSWORD: wordpress_password_temporal
+
+    depends_on:
+      - mariadb
+
+    # Guarda los archivos de WordPress de forma persistente.
+    volumes:
+      - wordpress_data:/var/www/html
+
+    networks:
+      - cloud1_network
+
+  # Interfaz web para administrar MariaDB.
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: cloud1_phpmyadmin
+
+    restart: unless-stopped
+
+    environment:
+      PMA_HOST: mariadb
+      PMA_PORT: 3306
+
+    depends_on:
+      - mariadb
+
+    networks:
+      - cloud1_network
+
+  # Proxy inverso que expone la aplicación al exterior.
+  nginx:
+    image: nginx:latest
+    container_name: cloud1_nginx
+
+    restart: unless-stopped
+
+    depends_on:
+      - wordpress
+      - phpmyadmin
+
+    ports:
+      - "80:80"
+      - "443:443"
+
+    volumes:
+      - ./default.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+
+    networks:
+      - cloud1_network
+
+# Volumen persistente para la base de datos.
+volumes:
+  mariadb_data:
+  wordpress_data:
+
+# Red privada que utilizarán los servicios de Cloud-1.
+networks:
+  cloud1_network:
+    driver: bridge

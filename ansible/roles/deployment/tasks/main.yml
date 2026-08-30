@@ -1,0 +1,47 @@
+---
+
+# Crea el directorio en el que se desplegará la aplicación.
+- name: Crear directorio de despliegue
+  ansible.builtin.file:
+    path: /opt/cloud-1
+    state: directory
+    mode: "0755"
+
+# Crea el directorio donde se guardarán los datos persistentes.
+- name: Crear directorio para datos persistentes
+  ansible.builtin.file:
+    path: /opt/cloud-1/data
+    state: directory
+    mode: "0755"
+
+# Copia el archivo Docker Compose desde el repositorio a la VM.
+- name: Copiar docker-compose.yml a la VM
+  ansible.builtin.copy:
+    src: ../../../docker/docker-compose.yml
+    dest: /opt/cloud-1/docker-compose.yml
+    mode: "0644"
+
+# Copia la configuración de Nginx a la VM.
+- name: Copiar configuracion de Nginx
+  ansible.builtin.copy:
+    src: ../../../docker/nginx/default.conf
+    dest: /opt/cloud-1/default.conf
+    mode: "0644"
+
+# Crea el directorio donde se guardarán los certificados TLS.
+- name: Crear directorio para certificados TLS
+  ansible.builtin.file:
+    path: /opt/cloud-1/certs
+    state: directory
+    mode: "0755"
+
+# Genera un certificado TLS autofirmado solo si todavía no existe.
+- name: Generar certificado TLS autofirmado
+  ansible.builtin.command:
+    cmd: >
+      openssl req -x509 -nodes -days 365
+      -newkey rsa:2048
+      -keyout /opt/cloud-1/certs/key.pem
+      -out /opt/cloud-1/certs/cert.pem
+      -subj "/CN=cloud-1"
+    creates: /opt/cloud-1/certs/cert.pem

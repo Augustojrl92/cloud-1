@@ -5,4 +5,7 @@
   become: true
 
   roles:
+    # Instala y configura Docker en los servidores del grupo cloud.
     - docker
+    # Prepara el directorio destinado al despliegue de la aplicación.
+    - deployment
