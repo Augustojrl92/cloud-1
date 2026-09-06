@@ -41,6 +41,30 @@ services:
     networks:
       - cloud1_network
 
+  # Herramienta de línea de comandos para configurar WordPress.
+  wordpress-cli:
+    image: wordpress:cli
+    container_name: cloud1_wordpress_cli
+
+    depends_on:
+      - mariadb
+      - wordpress
+
+    environment:
+      WORDPRESS_DB_HOST: mariadb:3306
+      WORDPRESS_DB_NAME: ${MARIADB_DATABASE}
+      WORDPRESS_DB_USER: ${MARIADB_USER}
+      WORDPRESS_DB_PASSWORD: ${MARIADB_PASSWORD}
+
+    volumes:
+      - wordpress_data:/var/www/html
+
+    networks:
+      - cloud1_network
+
+    profiles:
+      - cli
+
   # Interfaz web para administrar MariaDB.
   phpmyadmin:
     image: phpmyadmin:latest

@@ -53,3 +53,80 @@
       -out /opt/cloud-1/certs/cert.pem
       -subj "/CN=cloud-1"
     creates: /opt/cloud-1/certs/cert.pem
+
+# Levanta o actualiza todos los servicios definidos en Docker Compose.
+- name: Levantar servicios con Docker Compose
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: /opt/cloud-1
+  register: compose_up
+  changed_when: >
+    'Created' in compose_up.stdout or
+    'Recreated' in compose_up.stdout or
+    'Started' in compose_up.stdout
+
+# Reinicia Nginx si Compose recreó o inició servicios.
+- name: Reiniciar Nginx despues del despliegue
+  ansible.builtin.command:
+    cmd: docker compose restart nginx
+    chdir: /opt/cloud-1
+  when: compose_up.changed
+
+# Comprueba si WordPress ya está instalado.
+- name: Comprobar si WordPress esta instalado
+  ansible.builtin.shell:
+    cmd: >
+      docker compose run --rm wordpress-cli
+      core is-installed
+      --path=/var/www/html
+      --allow-root
+    chdir: /opt/cloud-1
+  register: wordpress_installed
+  changed_when: false
+  failed_when: false
+
+# Instala WordPress únicamente si todavía no existe una instalación.
+- name: Instalar WordPress
+  ansible.builtin.shell:
+    cmd: |
+      set -a
+      . /opt/cloud-1/.env
+      set +a
+
+      docker compose run --rm wordpress-cli \
+        core install \
+        --url="https://{{ ansible_host }}" \
+        --title="$WORDPRESS_TITLE" \
+        --admin_user="$WORDPRESS_ADMIN_USER" \
+        --admin_password="$WORDPRESS_ADMIN_PASSWORD" \
+        --admin_email="$WORDPRESS_ADMIN_EMAIL" \
+        --skip-email \
+        --path=/var/www/html \
+        --allow-root
+    chdir: /opt/cloud-1
+  when: wordpress_installed.rc != 0
+  no_log: true
+
+# Mantiene la URL de WordPress sincronizada con la IP pública actual.
+- name: Actualizar URL principal de WordPress
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm wordpress-cli
+      option update home https://{{ ansible_host }}
+      --path=/var/www/html
+      --allow-root
+    chdir: /opt/cloud-1
+  register: wordpress_home
+  changed_when: "'unchanged' not in wordpress_home.stdout"
+
+# Actualiza la URL interna de WordPress cuando cambia la IP pública.
+- name: Actualizar URL interna de WordPress
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm wordpress-cli
+      option update siteurl https://{{ ansible_host }}
+      --path=/var/www/html
+      --allow-root
+    chdir: /opt/cloud-1
+  register: wordpress_siteurl
+  changed_when: "'unchanged' not in wordpress_siteurl.stdout"
