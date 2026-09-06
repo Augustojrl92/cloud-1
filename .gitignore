@@ -7,3 +7,5 @@ crash.log
 application_default_credentials.json
 *.key
 *.pem
+.env
+docker/.env

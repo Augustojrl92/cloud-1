@@ -21,6 +21,14 @@
     dest: /opt/cloud-1/docker-compose.yml
     mode: "0644"
 
+# Copia las variables de entorno sin exponerlas en los logs de Ansible.
+- name: Copiar variables de entorno a la VM
+  ansible.builtin.copy:
+    src: ../../../docker/.env
+    dest: /opt/cloud-1/.env
+    mode: "0600"
+  no_log: true
+
 # Copia la configuración de Nginx a la VM.
 - name: Copiar configuracion de Nginx
   ansible.builtin.copy:
