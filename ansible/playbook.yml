@@ -9,3 +9,5 @@
     - docker
     # Prepara el directorio destinado al despliegue de la aplicación.
     - deployment
+    # Configura el firewall local de la VM.
+    - security

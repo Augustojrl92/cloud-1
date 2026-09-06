@@ -48,8 +48,9 @@ resource "google_compute_instance" "cloud1_vm" {
 
 # Regla de firewall para permitir acceso SSH.
 resource "google_compute_firewall" "allow_ssh" {
-  name    = "cloud1-allow-ssh"
-  network = "default"
+  name     = "cloud1-allow-ssh"
+  network  = "default"
+  priority = 900
 
   # Permite conexiones TCP por el puerto 22.
   allow {
@@ -67,8 +68,9 @@ resource "google_compute_firewall" "allow_ssh" {
 
 # Regla de firewall para permitir tráfico HTTP.
 resource "google_compute_firewall" "allow_http" {
-  name    = "cloud1-allow-http"
-  network = "default"
+  name     = "cloud1-allow-http"
+  network  = "default"
+  priority = 900
 
   # Puerto estándar HTTP.
   allow {
@@ -82,13 +84,30 @@ resource "google_compute_firewall" "allow_http" {
 
 # Regla de firewall para permitir tráfico HTTPS.
 resource "google_compute_firewall" "allow_https" {
-  name    = "cloud1-allow-https"
-  network = "default"
+  name     = "cloud1-allow-https"
+  network  = "default"
+  priority = 900
 
   # Puerto estándar HTTPS/TLS.
   allow {
     protocol = "tcp"
     ports    = ["443"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["cloud1"]
+}
+
+# Deniega cualquier otro tráfico entrante hacia la VM Cloud-1.
+# Las reglas de prioridad 900 para SSH, HTTP y HTTPS tienen preferencia.
+resource "google_compute_firewall" "deny_other_ingress" {
+  name      = "cloud1-deny-other-ingress"
+  network   = "default"
+  direction = "INGRESS"
+  priority  = 1000
+
+  deny {
+    protocol = "all"
   }
 
   source_ranges = ["0.0.0.0/0"]

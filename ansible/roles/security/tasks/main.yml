@@ -1,0 +1,69 @@
+---
+# Instala UFW para gestionar el firewall local de Ubuntu.
+- name: Instalar UFW
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+
+# Deniega por defecto las conexiones entrantes.
+- name: Denegar conexiones entrantes por defecto
+  community.general.ufw:
+    direction: incoming
+    policy: deny
+
+# Permite por defecto las conexiones salientes.
+- name: Permitir conexiones salientes por defecto
+  community.general.ufw:
+    direction: outgoing
+    policy: allow
+
+# Permite SSH.
+- name: Permitir SSH
+  community.general.ufw:
+    rule: allow
+    port: "22"
+    proto: tcp
+
+# Permite HTTP.
+- name: Permitir HTTP
+  community.general.ufw:
+    rule: allow
+    port: "80"
+    proto: tcp
+
+# Permite HTTPS.
+- name: Permitir HTTPS
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
+
+# Activa UFW después de haber configurado las reglas necesarias.
+- name: Activar UFW
+  community.general.ufw:
+    state: enabled
+
+# Protege el archivo con credenciales y variables sensibles.
+- name: Asegurar permisos del archivo .env
+  ansible.builtin.file:
+    path: /opt/cloud-1/.env
+    owner: root
+    group: root
+    mode: "0600"
+
+# Protege la clave privada TLS.
+- name: Asegurar permisos de la clave TLS
+  ansible.builtin.file:
+    path: /opt/cloud-1/certs/key.pem
+    owner: root
+    group: root
+    mode: "0600"
+
+# El certificado público puede ser legible.
+- name: Asegurar permisos del certificado TLS
+  ansible.builtin.file:
+    path: /opt/cloud-1/certs/cert.pem
+    owner: root
+    group: root
+    mode: "0644"
