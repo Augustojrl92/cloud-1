@@ -47,6 +47,7 @@ flowchart LR
 | UFW | Firewall local restrictivo | Implementado/verificado |
 | Firewall GCP | Prioridades y deny general | Implementado/verificado |
 | Custom VPC | `cloud1-vpc` + `cloud1-subnet` (`10.10.0.0/24`) | Implementado/verificado |
+| IP estática | Dirección regional reservada para `cloud-1-vm` | Implementado/verificado |
 | Idempotencia | Playbook repetido sin cambios | Implementado/verificado |
 | GCS remote state | Backend remoto compartido de Terraform | Implementado/verificado |
 | Inventory automático | Generación desde outputs de Terraform | Implementado/verificado |
@@ -247,7 +248,8 @@ Las dos VMs utilizan:
 - VPC propia `cloud1-vpc`.
 - Subred regional `cloud1-subnet`.
 - Rango privado `10.10.0.0/24`.
-- IP pública efímera.
+- `cloud-1-vm`: IP pública estática.
+- `cloud-1-vm-2`: IP pública efímera.
 - Tag `cloud1`.
 
 La topología de red se define explícitamente con Terraform:
@@ -303,8 +305,10 @@ configuración de acceso y finalmente `nat_ip`.
 El output `public_ip_2` hace lo mismo para `cloud1_vm_2`. Estos dos outputs
 permiten generar el inventory sin copiar manualmente las direcciones públicas.
 
-> La IP es efímera. Después de detener y volver a arrancar la VM puede cambiar,
-> por lo que el inventory de Ansible debe actualizarse con la IP actual.
+`cloud1_vm` utiliza la dirección regional estática `cloud1-static-ip`, por lo
+que su IP pública permanece estable. La IP pública de `cloud1_vm_2` sigue
+siendo efímera y puede cambiar al detener y volver a arrancar esa VM; el
+inventory se regenera automáticamente para recoger cualquier cambio.
 
 ## `.terraform` y `.terraform.lock.hcl`
 
@@ -346,8 +350,9 @@ con `terraform output -raw` y genera las entradas de `hosts.ini`. El usuario
 SSH se puede parametrizar con `CLOUD1_SSH_USER` y la clave con
 `CLOUD1_SSH_KEY`.
 
-La IP puede cambiar al reiniciar la VM, por lo que el inventory se regenera
-después de obtener nuevos outputs.
+La IP de `cloud2` puede cambiar al reiniciar la VM, por lo que el inventory se
+regenera después de obtener nuevos outputs. La IP de `cloud1` permanece
+estable gracias a `cloud1-static-ip`.
 
 Además, el usuario SSH puede variar según el equipo desde el que se trabaje.
 Por ejemplo, `gcloud compute ssh` puede registrar automáticamente una clave
@@ -1435,6 +1440,81 @@ Plan: 0 to add, 2 to change, 0 to destroy
 subredes y reglas de firewall del proyecto sin depender de la configuración
 heredada de la VPC `default`.
 
+## Paso 41 — Reservar una IP pública estática para la VM principal
+
+**Objetivo.** Evitar que la dirección pública de `cloud-1-vm` cambie y mantener
+estable el acceso por SSH, Ansible y HTTPS.
+
+**Solución.** Se creó una dirección regional estática administrada por
+Terraform:
+
+```hcl
+resource "google_compute_address" "cloud1_static_ip" {
+  name   = "cloud1-static-ip"
+  region = var.region
+}
+```
+
+La interfaz de red de la VM principal pasó a utilizar esa dirección:
+
+```hcl
+network_interface {
+  subnetwork = google_compute_subnetwork.cloud1_subnet.id
+
+  access_config {
+    nat_ip = google_compute_address.cloud1_static_ip.address
+  }
+}
+```
+
+La segunda VM mantiene una IP pública efímera, ya que se utiliza principalmente
+para validar despliegues multi-servidor.
+
+Estado verificado:
+
+```text
+cloud-1-vm
+  IP privada: 10.10.0.2
+  IP pública estática: 136.113.10.158
+
+cloud-1-vm-2
+  IP privada: 10.10.0.3
+  IP pública efímera: 104.198.45.32
+```
+
+Terraform aplicó el cambio sin destruir la VM:
+
+```text
+Plan: 1 to add, 1 to change, 0 to destroy
+```
+
+La dirección reservada quedó en estado:
+
+```text
+cloud1-static-ip → IN_USE
+```
+
+Después del cambio, el inventory de Ansible se regeneró automáticamente desde
+los outputs de Terraform.
+
+Validación:
+
+```text
+make ping:
+cloud1 → pong
+cloud2 → pong
+
+make deploy:
+cloud1 → unreachable=0 failed=0
+cloud2 → unreachable=0 failed=0
+
+HTTP  → 301 hacia HTTPS
+HTTPS → 200 OK
+```
+
+**Aprendizaje.** Una IP pública estática elimina cambios inesperados en el
+endpoint principal y hace más estable la automatización del despliegue.
+
 ## Estado actual de las validaciones obligatorias
 
 Las validaciones principales del subject quedaron completadas:
@@ -1447,8 +1527,7 @@ Las validaciones principales del subject quedaron completadas:
 ## Estado actual y validaciones pendientes
 
 La automatización principal y las validaciones obligatorias están completadas.
-Quedan como mejoras opcionales la IP estática, backups, monitorización y
-CI/CD.
+Quedan como mejoras opcionales backups, monitorización y CI/CD.
 
 ---
 
@@ -1627,7 +1706,7 @@ relevantes son `22`, `80` y `443`.
 | Contenedor portable `cloud1-tools` | IMPLEMENTADO/VERIFICADO |
 | Deployment completo desde el contenedor portable | IMPLEMENTADO/VERIFICADO |
 | Idempotencia desde el contenedor portable | IMPLEMENTADO/VERIFICADO |
-| IP estática | MEJORA FUTURA |
+| IP estática para `cloud-1-vm` | IMPLEMENTADO/VERIFICADO |
 | Backups | MEJORA FUTURA |
 | Monitorización | MEJORA FUTURA |
 | CI/CD | MEJORA FUTURA |
@@ -1639,11 +1718,10 @@ relevantes son `22`, `80` y `443`.
 Los requisitos principales ya están implementados y validados. Las mejoras
 opcionales siguientes quedan fuera del flujo principal:
 
-1. Valorar una IP estática.
-2. Añadir backups.
-3. Añadir monitorización.
-4. Añadir CI/CD.
-5. Valorar un gestor de secretos dedicado.
+1. Añadir backups.
+2. Añadir monitorización.
+3. Añadir CI/CD.
+4. Valorar un gestor de secretos dedicado.
 
 ---
 
@@ -1655,7 +1733,7 @@ opcionales siguientes quedan fuera del flujo principal:
 - ADC para autenticación del provider.
 - Compute Engine.
 - Firewall y tags de GCP.
-- IP pública efímera.
+- IP pública estática y efímera.
 - SSH y claves públicas/privadas.
 - Diferencia entre entornos Windows, WSL y Linux de 42.
 - Inventory, playbook, roles y Ansible Facts.
@@ -1733,11 +1811,10 @@ el sistema confíe por defecto.
 ### ¿Cuál es una limitación actual importante?
 
 Las validaciones principales del subject ya se completaron: fresh deployment,
-WordPress sobre datos nuevos, acceso root y multi-servidor. Las limitaciones
-actuales son principalmente mejoras de arquitectura: la IP sigue siendo
-efímera y el inventory debe regenerarse cuando cambian las IPs. Además, un
-gestor de secretos dedicado sería una mejora frente al `.env` local ignorado
-por Git.
+WordPress sobre datos nuevos, acceso root y multi-servidor. La IP de la VM
+principal es estática; la segunda VM mantiene una IP efímera, por lo que el
+inventory debe regenerarse si cambia. Además, un gestor de secretos dedicado
+sería una mejora frente al `.env` local ignorado por Git.
 
 ---
 

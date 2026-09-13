@@ -11,6 +11,12 @@ resource "google_compute_subnetwork" "cloud1_subnet" {
   network       = google_compute_network.cloud1_vpc.id
 }
 
+# IP pública regional reservada para la VM principal.
+resource "google_compute_address" "cloud1_static_ip" {
+  name   = "cloud1-static-ip"
+  region = var.region
+}
+
 # Crea una máquina virtual en Google Compute Engine.
 resource "google_compute_instance" "cloud1_vm" {
 
@@ -53,6 +59,7 @@ resource "google_compute_instance" "cloud1_vm" {
     # Este bloque hace que Google asigne una IP pública a la máquina virtual.
     # La necesitaremos para SSH, HTTP y HTTPS.
     access_config {
+      nat_ip = google_compute_address.cloud1_static_ip.address
     }
   }
 
