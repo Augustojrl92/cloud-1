@@ -29,7 +29,7 @@ flowchart LR
 |---|---|---|
 | Terraform | Aprovisionar VM, red y firewall | Implementado/verificado |
 | Ansible | Configurar Ubuntu e instalar Docker | Implementado/verificado |
-| Deployment | Automatización completa del despliegue | Implementado; validación fresh pendiente |
+| Deployment | Automatización completa del despliegue | Implementado/verificado en despliegue fresh |
 | Docker Compose | Definir los servicios de la aplicación | Implementado/verificado |
 | Nginx | Reverse proxy y terminación TLS | Implementado/verificado |
 | TLS | Certificado autofirmado y HTTPS | Implementado/verificado |
@@ -194,11 +194,15 @@ Cada bloque define `description`, `type` y `default`. Usar
 
 ## `terraform/main.tf`
 
-Define una instancia `google_compute_instance.cloud1_vm` y cuatro recursos de
-firewall.
+Define dos instancias, `google_compute_instance.cloud1_vm` y
+`google_compute_instance.cloud1_vm_2`, además de cuatro recursos de firewall.
 
 `google_compute_instance.cloud1_vm` es la dirección lógica de Terraform;
 `cloud-1-vm` es el nombre real dentro de Google Cloud.
+
+La segunda instancia, `cloud-1-vm-2`, utiliza la misma imagen, zona, tipo de
+máquina y tag `cloud1`. Por ese tag reutiliza automáticamente las reglas de
+firewall existentes y permite validar despliegues fresh y multi-servidor.
 
 La VM utiliza:
 
@@ -264,7 +268,7 @@ sea la misma.
 Define:
 
 - El grupo lógico `cloud`.
-- El alias `cloud1`.
+- Los aliases `cloud1` y `cloud2` para validar despliegue multi-servidor.
 - La IP pública actual.
 - El usuario SSH.
 - La clave privada usada para la conexión.
@@ -357,6 +361,12 @@ Repositorio
 La persistencia actual utiliza los named volumes de Docker `wordpress_data` y
 `mariadb_data`, no `/opt/cloud-1/data`.
 
+Además, autoriza de forma declarativa la clave pública de la máquina de control
+en `/root/.ssh/authorized_keys`, permitiendo acceso SSH directo como `root`
+mediante clave pública. La configuración efectiva de SSH se verificó con
+`PermitRootLogin without-password`, `PubkeyAuthentication yes` y
+`PasswordAuthentication no`.
+
 ## Role `security`
 
 El role `security` está implementado. Instala y activa UFW con política
@@ -426,6 +436,11 @@ https://IP_VM/phpmyadmin/  → phpMyAdmin
 WordPress y pertenece al perfil `cli`. Ansible lo ejecuta bajo demanda para
 comprobar la instalación, instalar WordPress y actualizar sus URLs. No publica
 puertos ni forma parte de la entrada web permanente.
+
+Durante la validación fresh se detectó que `wordpress:cli` utiliza `www-data`
+con UID `82`, mientras que el contenedor principal de WordPress utiliza UID
+`33`. Para compartir el volumen con permisos coherentes, `wordpress-cli` se
+ejecuta con `user: "33:33"`.
 
 ---
 
@@ -1096,15 +1111,105 @@ SSH siguió funcionando mediante `make ping`, que devolvió `pong`.
 **Resultado.** La configuración completa —Docker, deployment, WordPress,
 TLS, UFW y permisos— quedó verificada como idempotente.
 
+## Paso 30 — Acceso SSH directo como root
+
+**Objetivo.** Validar el acceso directo como `root` exigido por el subject sin
+habilitar autenticación por contraseña.
+
+**Solución.** Se añadió al role `security` una tarea
+`ansible.posix.authorized_key` que copia la clave pública de la máquina de
+control a `/root/.ssh/authorized_keys`.
+
+La configuración efectiva de OpenSSH se verificó como:
+
+```text
+PermitRootLogin without-password
+PubkeyAuthentication yes
+PasswordAuthentication no
+```
+
+La conexión directa mediante SSH como `root` se validó correctamente.
+
+## Paso 31 — Añadir una segunda VM para validación multi-servidor
+
+Terraform se amplió con `google_compute_instance.cloud1_vm_2`, una segunda
+instancia Ubuntu 22.04 LTS con la misma etiqueta `cloud1`. Las reglas de
+firewall existentes se reutilizan automáticamente mediante ese tag.
+
+El plan esperado para añadirla fue:
+
+```text
+Plan: 1 to add, 0 to change, 0 to destroy.
+```
+
+## Paso 32 — Diagnóstico del despliegue fresh
+
+En la primera ejecución sobre una VM completamente nueva, Ansible llegó hasta
+`Instalar WordPress` y falló. La prueba permitió detectar dos problemas reales:
+
+1. Las llamadas a WP-CLI omitían el ejecutable `wp`. Se corrigieron:
+
+   ```text
+   core is-installed  → wp core is-installed
+   core install       → wp core install
+   option update      → wp option update
+   ```
+
+2. `wordpress-cli` y WordPress usaban UID distintos para `www-data`:
+
+   ```text
+   wordpress       → UID 33
+   wordpress-cli   → UID 82
+   ```
+
+   Se corrigió el servicio auxiliar con `user: "33:33"` para compartir el
+   volumen con permisos coherentes.
+
+## Paso 33 — Validación fresh definitiva
+
+La segunda VM se destruyó y recreó mediante Terraform para garantizar un
+entorno realmente vacío. Después se ejecutó el playbook únicamente contra
+`cloud2`.
+
+Resultado:
+
+```text
+cloud2 : ok=31 changed=17 unreachable=0 failed=0 skipped=1
+```
+
+También se verificó HTTPS con `200 OK`, WordPress instalado mediante
+`wp core is-installed` con retorno `0`, y los cuatro servicios principales
+ejecutándose. WordPress y phpMyAdmin fueron accesibles desde el navegador.
+
+## Paso 34 — Despliegue paralelo multi-servidor
+
+El inventory se probó con `cloud1` y `cloud2` dentro del grupo `cloud`. El
+playbook se ejecutó sin `--limit`, por lo que Ansible aplicó las tareas a ambos
+hosts.
+
+Resultado final:
+
+```text
+cloud1 : ok=30 changed=2 unreachable=0 failed=0 skipped=2
+cloud2 : ok=30 changed=0 unreachable=0 failed=0 skipped=2
+```
+
+Se verificaron también las páginas de WordPress y phpMyAdmin en ambas VMs.
+
+## Estado actual de las validaciones obligatorias
+
+Las validaciones principales del subject quedaron completadas:
+
+- Despliegue completamente fresco desde cero: verificado.
+- Instalación automática de WordPress sobre datos nuevos: verificada.
+- Acceso SSH directo como root mediante clave pública: verificado.
+- Despliegue paralelo en varios servidores: verificado.
+
 ## Estado actual y validaciones pendientes
 
-La automatización principal está implementada y verificada. Antes de considerar
-el proyecto completamente cerrado quedan estas validaciones:
-
-- Despliegue completamente fresco desde cero.
-- Instalación automática de WordPress sobre una infraestructura y datos nuevos.
-- Revisión del requisito de acceso como root exigido por el subject.
-- Despliegue paralelo en varios servidores.
+La automatización principal y las validaciones obligatorias están completadas.
+Quedan como mejoras opcionales la IP estática, una VPC propia, backups,
+monitorización y CI/CD.
 
 ---
 
@@ -1254,7 +1359,7 @@ relevantes son `22`, `80` y `443`.
 | Output de IP pública | IMPLEMENTADO |
 | Inventory y conexión SSH | IMPLEMENTADO |
 | Role Docker | IMPLEMENTADO |
-| Role deployment | IMPLEMENTADO; VALIDACIÓN FRESH PENDIENTE |
+| Role deployment | IMPLEMENTADO/VERIFICADO |
 | `/opt/cloud-1` y estructura remota | IMPLEMENTADO |
 | Docker Compose | IMPLEMENTADO |
 | MariaDB | IMPLEMENTADO |
@@ -1262,7 +1367,7 @@ relevantes son `22`, `80` y `443`.
 | WordPress | IMPLEMENTADO |
 | Volumen WordPress | IMPLEMENTADO |
 | phpMyAdmin | IMPLEMENTADO |
-| `wordpress-cli` e instalación automatizada | IMPLEMENTADO |
+| `wordpress-cli` e instalación automatizada | IMPLEMENTADO/VERIFICADO |
 | Nginx reverse proxy | IMPLEMENTADO |
 | HTTP → HTTPS | IMPLEMENTADO |
 | Certificado TLS autofirmado | IMPLEMENTADO |
@@ -1272,10 +1377,10 @@ relevantes son `22`, `80` y `443`.
 | Role security y UFW | IMPLEMENTADO/VERIFICADO |
 | Firewall GCP con prioridades y deny general | IMPLEMENTADO/VERIFICADO |
 | Idempotencia final del playbook | IMPLEMENTADO/VERIFICADO |
-| Despliegue completamente fresco desde cero | PENDIENTE DE VALIDACIÓN FINAL |
-| Instalación automática sobre datos totalmente nuevos | PENDIENTE DE VALIDACIÓN FINAL |
-| Acceso como root exigido por el subject | PENDIENTE DE VALIDACIÓN FINAL |
-| Despliegue paralelo en varios servidores | PENDIENTE DE VALIDACIÓN FINAL |
+| Despliegue completamente fresco desde cero | IMPLEMENTADO/VERIFICADO |
+| Instalación automática sobre datos totalmente nuevos | IMPLEMENTADO/VERIFICADO |
+| Acceso como root exigido por el subject | IMPLEMENTADO/VERIFICADO |
+| Despliegue paralelo en varios servidores | IMPLEMENTADO/VERIFICADO |
 | IP estática | MEJORA FUTURA |
 | VPC propia | MEJORA FUTURA |
 | Backups | MEJORA FUTURA |
@@ -1286,14 +1391,17 @@ relevantes son `22`, `80` y `443`.
 
 # Próximos pasos
 
-Orden recomendado:
+Los requisitos principales ya están implementados y validados. Las mejoras
+opcionales siguientes quedan fuera del flujo principal:
 
-1. Validar un despliegue completamente fresco desde cero.
-2. Validar la instalación automática de WordPress desde datos vacíos.
-3. Revisar el requisito de acceso como root exigido por el subject.
-4. Probar el despliegue paralelo en varios servidores.
-5. Añadir mejoras opcionales: IP estática, VPC propia, backups, monitorización
-   y CI/CD.
+1. Migrar el Terraform State a un backend remoto, por ejemplo GCS.
+2. Automatizar el descubrimiento de IPs para evitar editar manualmente el
+   inventory.
+3. Valorar una IP estática.
+4. Crear una VPC propia.
+5. Añadir backups.
+6. Añadir monitorización.
+7. Añadir CI/CD.
 
 ---
 
@@ -1328,6 +1436,10 @@ Orden recomendado:
 - UFW y permisos de archivos sensibles.
 - Profiles de Compose y automatización con WP-CLI.
 - Diagnóstico mediante `docker ps`, logs y `curl`.
+- Despliegue multi-host con Ansible.
+- Acceso SSH directo como root mediante clave pública.
+- Diagnóstico de permisos por UID entre contenedores.
+- Validación fresh recreando infraestructura con Terraform.
 
 ---
 
@@ -1371,11 +1483,12 @@ el sistema confíe por defecto.
 
 ### ¿Cuál es una limitación actual importante?
 
-Todavía hay que validar un despliegue completamente fresco, la instalación
-automática de WordPress desde datos vacíos, el requisito de acceso como root
-del subject y el despliegue paralelo en varios servidores. Las credenciales
-temporales ya fueron rotadas y el mecanismo actual usa un `.env` ignorado por
-Git, aunque un gestor de secretos sería una mejora futura.
+Las validaciones principales del subject ya se completaron: fresh deployment,
+WordPress sobre datos nuevos, acceso root y multi-servidor. Las limitaciones
+actuales son principalmente mejoras de arquitectura: la IP sigue siendo
+efímera, el Terraform State sigue siendo local y el inventory requiere
+actualizar las IPs cuando cambian. Además, un gestor de secretos dedicado sería
+una mejora frente al `.env` local ignorado por Git.
 
 ---
 
