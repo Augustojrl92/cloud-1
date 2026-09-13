@@ -1,3 +1,16 @@
+# Red privada propia para los recursos de Cloud-1.
+resource "google_compute_network" "cloud1_vpc" {
+  name                    = "cloud1-vpc"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "cloud1_subnet" {
+  name          = "cloud1-subnet"
+  ip_cidr_range = "10.10.0.0/24"
+  region        = var.region
+  network       = google_compute_network.cloud1_vpc.id
+}
+
 # Crea una máquina virtual en Google Compute Engine.
 resource "google_compute_instance" "cloud1_vm" {
 
@@ -11,6 +24,9 @@ resource "google_compute_instance" "cloud1_vm" {
   # Zona donde se creará la VM.
   # También viene de variables.tf.
   zone = var.zone
+
+  # Permite detener la VM para aplicar cambios de configuración in-place.
+  allow_stopping_for_update = true
 
   # Configuración del disco principal de la máquina.
   boot_disk {
@@ -31,8 +47,8 @@ resource "google_compute_instance" "cloud1_vm" {
 
   # Configuración de red de la VM.
   network_interface {
-    # Utilizamos por ahora la red "default" de Google Cloud.
-    network = "default"
+    # Conectamos la VM a la subred privada de Cloud-1.
+    subnetwork = google_compute_subnetwork.cloud1_subnet.id
 
     # Este bloque hace que Google asigne una IP pública a la máquina virtual.
     # La necesitaremos para SSH, HTTP y HTTPS.
@@ -48,9 +64,10 @@ resource "google_compute_instance" "cloud1_vm" {
 
 # Segunda VM para validar despliegue paralelo con Ansible.
 resource "google_compute_instance" "cloud1_vm_2" {
-  name         = "cloud-1-vm-2"
-  machine_type = var.machine_type
-  zone         = var.zone
+  name                      = "cloud-1-vm-2"
+  machine_type              = var.machine_type
+  zone                      = var.zone
+  allow_stopping_for_update = true
 
   boot_disk {
     initialize_params {
@@ -61,7 +78,7 @@ resource "google_compute_instance" "cloud1_vm_2" {
   }
 
   network_interface {
-    network = "default"
+    subnetwork = google_compute_subnetwork.cloud1_subnet.id
 
     access_config {
     }
@@ -73,7 +90,7 @@ resource "google_compute_instance" "cloud1_vm_2" {
 # Regla de firewall para permitir acceso SSH.
 resource "google_compute_firewall" "allow_ssh" {
   name     = "cloud1-allow-ssh"
-  network  = "default"
+  network  = google_compute_network.cloud1_vpc.id
   priority = 900
 
   # Permite conexiones TCP por el puerto 22.
@@ -93,7 +110,7 @@ resource "google_compute_firewall" "allow_ssh" {
 # Regla de firewall para permitir tráfico HTTP.
 resource "google_compute_firewall" "allow_http" {
   name     = "cloud1-allow-http"
-  network  = "default"
+  network  = google_compute_network.cloud1_vpc.id
   priority = 900
 
   # Puerto estándar HTTP.
@@ -109,7 +126,7 @@ resource "google_compute_firewall" "allow_http" {
 # Regla de firewall para permitir tráfico HTTPS.
 resource "google_compute_firewall" "allow_https" {
   name     = "cloud1-allow-https"
-  network  = "default"
+  network  = google_compute_network.cloud1_vpc.id
   priority = 900
 
   # Puerto estándar HTTPS/TLS.
@@ -126,7 +143,7 @@ resource "google_compute_firewall" "allow_https" {
 # Las reglas de prioridad 900 para SSH, HTTP y HTTPS tienen preferencia.
 resource "google_compute_firewall" "deny_other_ingress" {
   name      = "cloud1-deny-other-ingress"
-  network   = "default"
+  network   = google_compute_network.cloud1_vpc.id
   direction = "INGRESS"
   priority  = 1000
 
