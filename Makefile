@@ -6,6 +6,8 @@ ANSIBLE_DIR := ansible
 INVENTORY := $(ANSIBLE_DIR)/inventory/hosts.ini
 PLAYBOOK := $(ANSIBLE_DIR)/playbook.yml
 
+.PHONY: tools
+
 help:
 	@echo "Cloud-1 commands"
 	@echo ""
@@ -30,6 +32,7 @@ help:
 	@echo "  make down"
 	@echo "  make ps"
 	@echo "  make logs"
+	@echo "  make tools"
 
 tf-init:
 	cd terraform && terraform init
@@ -83,3 +86,10 @@ ps:
 logs:
 	ansible cloud -i $(INVENTORY) -b -m shell \
 		-a "cd /opt/cloud-1 && docker compose logs --tail=100"
+
+tools:
+	docker run --rm -it \
+		-v "$(PWD):/workspace" \
+		-v "$(HOME)/.config/gcloud:/root/.config/gcloud" \
+		-v "$(HOME)/.ssh:/root/.ssh:ro" \
+		cloud1-tools
