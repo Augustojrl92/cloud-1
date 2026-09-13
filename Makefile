@@ -6,7 +6,7 @@ ANSIBLE_DIR := ansible
 INVENTORY := $(ANSIBLE_DIR)/inventory/hosts.ini
 PLAYBOOK := $(ANSIBLE_DIR)/playbook.yml
 
-.PHONY: tools
+.PHONY: inventory tools
 
 help:
 	@echo "Cloud-1 commands"
@@ -23,6 +23,7 @@ help:
 	@echo "  make vm-status"
 	@echo ""
 	@echo "Ansible:"
+	@echo "  make inventory"
 	@echo "  make ping"
 	@echo "  make deploy"
 	@echo ""
@@ -62,28 +63,31 @@ vm-status:
 		--filter="name=$(VM_NAME)" \
 		--format="table(name,status,networkInterfaces[0].accessConfigs[0].natIP:label=EXTERNAL_IP)"
 
-ping:
+inventory:
+	./scripts/generate_inventory.sh
+
+ping: inventory
 	ansible all -i $(INVENTORY) -m ping
 
-deploy:
+deploy: inventory
 	ansible-playbook -i $(INVENTORY) $(PLAYBOOK)
 
-compose-config:
+compose-config: inventory
 	ansible cloud -i $(INVENTORY) -b -m shell \
 		-a "cd /opt/cloud-1 && docker compose config"
 
-up:
+up: inventory
 	ansible cloud -i $(INVENTORY) -b -m shell \
 		-a "cd /opt/cloud-1 && docker compose up -d"
 
-down:
+down: inventory
 	ansible cloud -i $(INVENTORY) -b -m shell \
 		-a "cd /opt/cloud-1 && docker compose down"
 
-ps:
+ps: inventory
 	ansible cloud -i $(INVENTORY) -b -a "docker ps"
 
-logs:
+logs: inventory
 	ansible cloud -i $(INVENTORY) -b -m shell \
 		-a "cd /opt/cloud-1 && docker compose logs --tail=100"
 
