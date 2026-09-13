@@ -45,6 +45,7 @@ services:
   wordpress-cli:
     image: wordpress:cli
     container_name: cloud1_wordpress_cli
+    user: "33:33"
 
     depends_on:
       - mariadb

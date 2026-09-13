@@ -77,7 +77,7 @@
   ansible.builtin.shell:
     cmd: >
       docker compose run --rm wordpress-cli
-      core is-installed
+      wp core is-installed
       --path=/var/www/html
       --allow-root
     chdir: /opt/cloud-1
@@ -94,7 +94,7 @@
       set +a
 
       docker compose run --rm wordpress-cli \
-        core install \
+        wp core install \
         --url="https://{{ ansible_host }}" \
         --title="$WORDPRESS_TITLE" \
         --admin_user="$WORDPRESS_ADMIN_USER" \
@@ -112,7 +112,7 @@
   ansible.builtin.command:
     cmd: >
       docker compose run --rm wordpress-cli
-      option update home https://{{ ansible_host }}
+      wp option update home https://{{ ansible_host }}
       --path=/var/www/html
       --allow-root
     chdir: /opt/cloud-1
@@ -124,7 +124,7 @@
   ansible.builtin.command:
     cmd: >
       docker compose run --rm wordpress-cli
-      option update siteurl https://{{ ansible_host }}
+      wp option update siteurl https://{{ ansible_host }}
       --path=/var/www/html
       --allow-root
     chdir: /opt/cloud-1

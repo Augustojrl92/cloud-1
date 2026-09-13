@@ -46,6 +46,30 @@ resource "google_compute_instance" "cloud1_vm" {
   tags = ["cloud1"]
 }
 
+# Segunda VM para validar despliegue paralelo con Ansible.
+resource "google_compute_instance" "cloud1_vm_2" {
+  name         = "cloud-1-vm-2"
+  machine_type = var.machine_type
+  zone         = var.zone
+
+  boot_disk {
+    initialize_params {
+      image = "ubuntu-os-cloud/ubuntu-2204-lts"
+      size  = 10
+      type  = "pd-balanced"
+    }
+  }
+
+  network_interface {
+    network = "default"
+
+    access_config {
+    }
+  }
+
+  tags = ["cloud1"]
+}
+
 # Regla de firewall para permitir acceso SSH.
 resource "google_compute_firewall" "allow_ssh" {
   name     = "cloud1-allow-ssh"
