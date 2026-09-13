@@ -1,9 +1,10 @@
 # Cloud-1
 
 Cloud-1 automatiza el camino desde infraestructura en Google Cloud hasta una
-aplicación web desplegada en contenedores sobre una VM remota. El despliegue
+aplicación web desplegada en contenedores sobre dos VMs remotas. El despliegue
 actual incluye automatización de WordPress, gestión separada de secretos,
-hardening del firewall local y reglas de entrada explícitas en GCP.
+hardening del firewall local, reglas de entrada explícitas en GCP y una VPC
+propia administrada con Terraform.
 
 El proyecto separa responsabilidades en tres capas:
 
@@ -16,8 +17,12 @@ El proyecto separa responsabilidades en tres capas:
 flowchart LR
     Repo["Repositorio local"] --> TF["Terraform"]
     TF --> GCP["Google Cloud"]
-    GCP --> VM["Compute Engine VM"]
-    VM --> SSH["SSH"]
+    GCP --> VPC["cloud1-vpc"]
+    VPC --> SUBNET["cloud1-subnet · 10.10.0.0/24"]
+    SUBNET --> VM1["cloud-1-vm · 10.10.0.2"]
+    SUBNET --> VM2["cloud-1-vm-2 · 10.10.0.3"]
+    VM1 --> SSH["SSH"]
+    VM2 --> SSH
     SSH --> Ansible["Ansible"]
     Ansible --> Docker["Docker Engine + Compose"]
     Docker --> App["Nginx + WordPress + MariaDB + phpMyAdmin"]
@@ -41,6 +46,7 @@ flowchart LR
 | Security | Role de hardening y permisos | Implementado/verificado |
 | UFW | Firewall local restrictivo | Implementado/verificado |
 | Firewall GCP | Prioridades y deny general | Implementado/verificado |
+| Custom VPC | `cloud1-vpc` + `cloud1-subnet` (`10.10.0.0/24`) | Implementado/verificado |
 | Idempotencia | Playbook repetido sin cambios | Implementado/verificado |
 | GCS remote state | Backend remoto compartido de Terraform | Implementado/verificado |
 | Inventory automático | Generación desde outputs de Terraform | Implementado/verificado |
@@ -58,17 +64,23 @@ aplicación. Esta separación evita mezclar cloud, sistema operativo y servicios
 ```mermaid
 flowchart TB
     Internet["Internet"] --> GCPFW["Firewall GCP"]
-    GCPFW --> UFW["UFW"]
-    UFW --> SSH["SSH :22"]
-    UFW --> Nginx["Nginx :80/:443"]
-    Nginx --> WordPress["WordPress"]
-    Nginx --> PMA["phpMyAdmin"]
-    WordPress --> MariaDB["MariaDB"]
-    PMA --> MariaDB
-    WPCLI["wordpress-cli"] -. "configuración" .-> WordPress
+    GCPFW --> VPC["cloud1-vpc"]
+    subgraph SUBNET["cloud1-subnet · 10.10.0.0/24"]
+        VM1["cloud-1-vm · 10.10.0.2"]
+        VM2["cloud-1-vm-2 · 10.10.0.3"]
+    end
+    VPC --> SUBNET
+    VM1 --> UFW1["UFW"]
+    VM2 --> UFW2["UFW"]
+    UFW1 --> SSH1["SSH :22"]
+    UFW1 --> Nginx1["Nginx :80/:443"]
+    UFW2 --> SSH2["SSH :22"]
+    UFW2 --> Nginx2["Nginx :80/:443"]
+    Nginx1 --> App1["WordPress + phpMyAdmin + MariaDB"]
+    Nginx2 --> App2["WordPress + phpMyAdmin + MariaDB"]
 ```
 
-La VM expone únicamente los puertos previstos por el proyecto:
+Cada VM expone únicamente los puertos previstos por el proyecto:
 
 - `22/tcp` para SSH.
 - `80/tcp` para HTTP, redirigido a HTTPS.
@@ -217,8 +229,9 @@ Cada bloque define `description`, `type` y `default`. Usar
 
 ## `terraform/main.tf`
 
-Define dos instancias, `google_compute_instance.cloud1_vm` y
-`google_compute_instance.cloud1_vm_2`, además de cuatro recursos de firewall.
+Define una VPC, una subred regional, dos instancias
+(`google_compute_instance.cloud1_vm` y
+`google_compute_instance.cloud1_vm_2`) y cuatro recursos de firewall.
 
 `google_compute_instance.cloud1_vm` es la dirección lógica de Terraform;
 `cloud-1-vm` es el nombre real dentro de Google Cloud.
@@ -227,13 +240,37 @@ La segunda instancia, `cloud-1-vm-2`, utiliza la misma imagen, zona, tipo de
 máquina y tag `cloud1`. Por ese tag reutiliza automáticamente las reglas de
 firewall existentes y permite validar despliegues fresh y multi-servidor.
 
-La VM utiliza:
+Las dos VMs utilizan:
 
 - Ubuntu 22.04 LTS.
 - Disco de 10 GB `pd-balanced`.
-- Red `default`.
+- VPC propia `cloud1-vpc`.
+- Subred regional `cloud1-subnet`.
+- Rango privado `10.10.0.0/24`.
 - IP pública efímera.
 - Tag `cloud1`.
+
+La topología de red se define explícitamente con Terraform:
+
+```text
+cloud1-vpc
+└── cloud1-subnet 10.10.0.0/24
+    ├── cloud-1-vm
+    └── cloud-1-vm-2
+```
+
+Las direcciones privadas verificadas actualmente son:
+
+```text
+cloud-1-vm    → 10.10.0.2
+cloud-1-vm-2  → 10.10.0.3
+```
+
+La VPC utiliza `auto_create_subnetworks = false`, por lo que la subred no se
+crea automáticamente. Las interfaces de ambas VMs apuntan a
+`cloud1-subnet`. Además, `allow_stopping_for_update = true` permite que
+Terraform detenga temporalmente una VM para aplicar cambios de red in-place y
+la vuelva a iniciar.
 
 Las reglas de firewall permiten:
 
@@ -245,8 +282,9 @@ Las tres reglas `cloud1-allow-*` tienen prioridad `900`. La regla
 `cloud1-deny-other-ingress` tiene prioridad `1000`, deniega todo el resto del
 tráfico entrante y se aplica a las VMs con tag `cloud1`. Como en GCP un número
 menor significa mayor prioridad, SSH, HTTP y HTTPS se evalúan antes del deny.
-Esto evita que reglas heredadas de la VPC `default`, como `default-allow-rdp`
-para `3389`, permitan tráfico no deseado.
+Las cuatro reglas están asociadas explícitamente a `cloud1-vpc`, por lo que la
+seguridad de Cloud-1 ya no depende de reglas heredadas de la VPC `default`,
+como `default-allow-rdp` para `3389`.
 
 La base de datos no necesita una regla pública porque permanece en la red
 interna de Docker.
@@ -1362,6 +1400,41 @@ cloud2 : ok=30 changed=0 unreachable=0 failed=0 skipped=2
 Esto confirma que el entorno portable funciona de extremo a extremo y que el
 deployment sigue siendo idempotente ejecutado desde Docker.
 
+## Paso 40 — Crear una VPC propia y migrar las VMs
+
+**Objetivo.** Dejar de depender de la VPC `default` de Google Cloud y
+controlar explícitamente la topología de red desde Terraform.
+
+**Solución.** Se añadieron `google_compute_network.cloud1_vpc` y
+`google_compute_subnetwork.cloud1_subnet` con el rango privado
+`10.10.0.0/24`. Las dos interfaces de red se migraron desde la VPC `default`
+a `cloud1-subnet` y las cuatro reglas de firewall se asociaron a
+`cloud1-vpc`.
+
+La VPC utiliza `auto_create_subnetworks = false`. Para permitir que Terraform
+detenga temporalmente las VMs durante el cambio de red se añadió
+`allow_stopping_for_update = true` a ambas instancias.
+
+La topología quedó definida así:
+
+```text
+cloud1-vpc
+└── cloud1-subnet 10.10.0.0/24
+    ├── cloud-1-vm
+    └── cloud-1-vm-2
+```
+
+Después de la migración se revisó el plan de Terraform, que propuso el cambio
+de las dos VMs sin destruirlas:
+
+```text
+Plan: 0 to add, 2 to change, 0 to destroy
+```
+
+**Aprendizaje.** Una VPC propia permite controlar explícitamente red,
+subredes y reglas de firewall del proyecto sin depender de la configuración
+heredada de la VPC `default`.
+
 ## Estado actual de las validaciones obligatorias
 
 Las validaciones principales del subject quedaron completadas:
@@ -1374,8 +1447,8 @@ Las validaciones principales del subject quedaron completadas:
 ## Estado actual y validaciones pendientes
 
 La automatización principal y las validaciones obligatorias están completadas.
-Quedan como mejoras opcionales la IP estática, una VPC propia, backups,
-monitorización y CI/CD.
+Quedan como mejoras opcionales la IP estática, backups, monitorización y
+CI/CD.
 
 ---
 
@@ -1545,6 +1618,7 @@ relevantes son `22`, `80` y `443`.
 | Persistencia tras reinicio y `down` + `up` | IMPLEMENTADO/VERIFICADO |
 | Role security y UFW | IMPLEMENTADO/VERIFICADO |
 | Firewall GCP con prioridades y deny general | IMPLEMENTADO/VERIFICADO |
+| VPC propia `cloud1-vpc` y subred `10.10.0.0/24` | IMPLEMENTADO/VERIFICADO |
 | Idempotencia final del playbook | IMPLEMENTADO/VERIFICADO |
 | Despliegue completamente fresco desde cero | IMPLEMENTADO/VERIFICADO |
 | Instalación automática sobre datos totalmente nuevos | IMPLEMENTADO/VERIFICADO |
@@ -1554,7 +1628,6 @@ relevantes son `22`, `80` y `443`.
 | Deployment completo desde el contenedor portable | IMPLEMENTADO/VERIFICADO |
 | Idempotencia desde el contenedor portable | IMPLEMENTADO/VERIFICADO |
 | IP estática | MEJORA FUTURA |
-| VPC propia | MEJORA FUTURA |
 | Backups | MEJORA FUTURA |
 | Monitorización | MEJORA FUTURA |
 | CI/CD | MEJORA FUTURA |
@@ -1567,11 +1640,10 @@ Los requisitos principales ya están implementados y validados. Las mejoras
 opcionales siguientes quedan fuera del flujo principal:
 
 1. Valorar una IP estática.
-2. Crear una VPC propia.
-3. Añadir backups.
-4. Añadir monitorización.
-5. Añadir CI/CD.
-6. Valorar un gestor de secretos dedicado.
+2. Añadir backups.
+3. Añadir monitorización.
+4. Añadir CI/CD.
+5. Valorar un gestor de secretos dedicado.
 
 ---
 
@@ -1610,6 +1682,8 @@ opcionales siguientes quedan fuera del flujo principal:
 - Acceso SSH directo como root mediante clave pública.
 - Diagnóstico de permisos por UID entre contenedores.
 - Validación fresh recreando infraestructura con Terraform.
+- VPC propia, subredes regionales y migración de interfaces de red.
+- Actualizaciones in-place de VMs con `allow_stopping_for_update`.
 - Backend remoto GCS.
 - Inventory automático desde outputs de Terraform.
 - Parametrización de usuario y clave SSH.
