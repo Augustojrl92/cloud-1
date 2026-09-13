@@ -1,6 +1,11 @@
 # Declara los proveedores que Terraform necesita y su configuración.
 # El proveedor de Google permite trabajar con Google Cloud.
 terraform {
+  backend "gcs" {
+    bucket = "cloud-1-506415-tfstate"
+    prefix = "terraform/state"
+  }
+
   required_providers {
     google = {
       source  = "hashicorp/google"
