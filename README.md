@@ -42,6 +42,9 @@ flowchart LR
 | UFW | Firewall local restrictivo | Implementado/verificado |
 | Firewall GCP | Prioridades y deny general | Implementado/verificado |
 | Idempotencia | Playbook repetido sin cambios | Implementado/verificado |
+| GCS remote state | Backend remoto compartido de Terraform | Implementado/verificado |
+| Inventory automático | Generación desde outputs de Terraform | Implementado/verificado |
+| Entorno portable | Docker con Terraform, Ansible y gcloud | Implementado/verificado |
 
 Terraform aplica **Infrastructure as Code**: la infraestructura se expresa en
 archivos versionables, revisables y repetibles. Ansible aplica **Configuration
@@ -114,6 +117,10 @@ cloud-1/
 ├── .gitignore
 ├── README.md
 ├── cloud-1.pdf
+├── scripts/
+│   └── generate_inventory.sh
+├── tools/
+│   └── Dockerfile
 ├── terraform/
 │   ├── providers.tf
 │   ├── variables.tf
@@ -151,13 +158,29 @@ El `Makefile` proporciona accesos rápidos para operaciones frecuentes:
 - `make vm-start`
 - `make vm-stop`
 - `make vm-status`
+- `make inventory`
 - `make ping`
 - `make deploy`
 - `make ps`
 - `make logs`
+- `make tools`
 
 No es un requisito del subject; se incluye como herramienta de comodidad para
 desarrollo y evaluación.
+
+El target `make tools` abre el contenedor `cloud1-tools` con el repositorio
+montado en `/workspace`, las credenciales locales de gcloud disponibles y la
+carpeta SSH montada en modo solo lectura. Así, Terraform, Ansible, gcloud, los
+scripts y el propio Makefile se pueden utilizar desde un entorno portable.
+
+Dentro del contenedor se pueden ejecutar, por ejemplo:
+
+```bash
+terraform -chdir=terraform plan
+./scripts/generate_inventory.sh
+make ping
+make deploy
+```
 
 Los certificados TLS **no se guardan en el repositorio**. Ansible los genera
 directamente en la VM en:
@@ -239,13 +262,18 @@ google_compute_instance.cloud1_vm.network_interface[0].access_config[0].nat_ip
 La expresión recorre el recurso, la primera interfaz de red, la primera
 configuración de acceso y finalmente `nat_ip`.
 
+El output `public_ip_2` hace lo mismo para `cloud1_vm_2`. Estos dos outputs
+permiten generar el inventory sin copiar manualmente las direcciones públicas.
+
 > La IP es efímera. Después de detener y volver a arrancar la VM puede cambiar,
 > por lo que el inventory de Ansible debe actualizarse con la IP actual.
 
 ## `.terraform` y `.terraform.lock.hcl`
 
 `terraform init` descarga providers en `.terraform/`; es contenido generado y
-se ignora.
+se ignora. El state se almacena actualmente en el backend remoto GCS definido
+en `terraform/providers.tf`, usando el bucket del proyecto y el prefijo
+`terraform/state`.
 
 `.terraform.lock.hcl` fija versiones y hashes verificados del provider y sí se
 versiona.
@@ -253,7 +281,8 @@ versiona.
 El state local (`terraform.tfstate`) no debe subirse a Git: puede contener
 atributos de infraestructura y datos sensibles. En el clon usado para el
 proyecto fue necesario reconstruir el state importando la VM y las reglas que
-ya existían antes de aplicar el cambio del firewall.
+ya existían antes de aplicar el cambio del firewall; posteriormente se migró
+al backend remoto GCS.
 
 Al ejecutar `terraform init` desde Linux y Windows pueden aparecer hashes
 adicionales válidos para distintas plataformas aunque la versión del provider
@@ -273,7 +302,14 @@ Define:
 - El usuario SSH.
 - La clave privada usada para la conexión.
 
-La IP puede cambiar al reiniciar la VM.
+Las IPs públicas se obtienen automáticamente desde Terraform. El script
+`scripts/generate_inventory.sh` usa los outputs `public_ip` y `public_ip_2`
+con `terraform output -raw` y genera las entradas de `hosts.ini`. El usuario
+SSH se puede parametrizar con `CLOUD1_SSH_USER` y la clave con
+`CLOUD1_SSH_KEY`.
+
+La IP puede cambiar al reiniciar la VM, por lo que el inventory se regenera
+después de obtener nuevos outputs.
 
 Además, el usuario SSH puede variar según el equipo desde el que se trabaje.
 Por ejemplo, `gcloud compute ssh` puede registrar automáticamente una clave
@@ -373,6 +409,62 @@ El role `security` está implementado. Instala y activa UFW con política
 `deny` para conexiones entrantes y `allow` para conexiones salientes. Solo
 permite `22/tcp`, `80/tcp` y `443/tcp`. También asegura los permisos de los
 archivos sensibles: `.env` y `key.pem` con `0600`, y `cert.pem` con `0644`.
+
+---
+
+# Portabilidad
+
+## Terraform State remoto en GCS
+
+Terraform utiliza un backend remoto en Google Cloud Storage configurado en
+`terraform/providers.tf`:
+
+```text
+bucket: cloud-1-506415-tfstate
+prefix: terraform/state
+```
+
+El state local se migró al backend remoto y se validó con `terraform state list`,
+`gcloud storage ls` y `terraform plan`, que devolvió `No changes`.
+
+## Inventory automático
+
+`scripts/generate_inventory.sh` obtiene las IPs actuales mediante los outputs
+`public_ip` y `public_ip_2` de Terraform y genera
+`ansible/inventory/hosts.ini` con `cloud1` y `cloud2`.
+
+El script admite las variables `CLOUD1_SSH_USER` y `CLOUD1_SSH_KEY` para evitar
+fijar el usuario y la clave SSH al equipo desde el que se trabaja.
+
+El target `inventory` del `Makefile` ejecuta el script automáticamente antes de
+`make ping`, `make deploy`, `make compose-config`, `make up`, `make down`,
+`make ps` y `make logs`.
+
+## Contenedor portable de administración
+
+`tools/Dockerfile` construye la imagen `cloud1-tools` con Terraform, Ansible,
+Google Cloud CLI, Git, Python, OpenSSH client y Make. El repositorio se monta
+en `/workspace`; la configuración de gcloud se reutiliza y la carpeta SSH se
+monta en modo solo lectura. Las credenciales no se copian dentro de la imagen.
+
+Versiones verificadas dentro del contenedor:
+
+```text
+Terraform v1.16.2
+Ansible core 2.17.14
+Google Cloud SDK 584.0.0
+```
+
+El target `make tools` abre este entorno portable con un solo comando. Dentro
+se pueden ejecutar Terraform, generar el inventory y lanzar Ansible:
+
+```bash
+make tools
+terraform -chdir=terraform plan
+./scripts/generate_inventory.sh
+make ping
+make deploy
+```
 
 ---
 
@@ -1196,6 +1288,80 @@ cloud2 : ok=30 changed=0 unreachable=0 failed=0 skipped=2
 
 Se verificaron también las páginas de WordPress y phpMyAdmin en ambas VMs.
 
+## Paso 35 — Migrar Terraform State a GCS
+
+**Objetivo.** Compartir el state de Terraform entre equipos y entornos.
+
+**Solución.** Se configuró el backend `gcs` en `terraform/providers.tf` con el
+bucket `cloud-1-506415-tfstate` y el prefijo `terraform/state`. El state local
+se migró al bucket remoto y se validó con `terraform state list`, `gcloud
+storage ls` y `terraform plan`, que devolvió `No changes`.
+
+**Aprendizaje.** El backend remoto evita que el despliegue dependa de un state
+local aislado, aunque el state continúa sin versionarse en Git.
+
+## Paso 36 — Automatizar el inventory de Ansible
+
+**Objetivo.** Generar las IPs de `cloud1` y `cloud2` sin editar manualmente el
+inventory.
+
+**Solución.** Se añadió el output `public_ip_2` y el script
+`scripts/generate_inventory.sh`, que obtiene ambos outputs de Terraform y
+genera `ansible/inventory/hosts.ini`. La conectividad se validó con `make
+ping` y ambas VMs devolvieron `pong`.
+
+El script permite parametrizar el usuario y la clave con `CLOUD1_SSH_USER` y
+`CLOUD1_SSH_KEY`.
+
+## Paso 37 — Crear el entorno portable con Docker
+
+**Objetivo.** Ejecutar las herramientas del proyecto sin depender de las
+instalaciones del equipo anfitrión.
+
+**Solución.** Se creó `tools/Dockerfile` con Terraform, Ansible, Google Cloud
+CLI, Git, Python, OpenSSH client y Make. Las credenciales de gcloud y las
+claves SSH se reutilizan mediante bind mounts, sin copiarlas dentro de la
+imagen.
+
+Se verificaron dentro de `cloud1-tools`:
+
+```text
+Terraform v1.16.2
+Ansible core 2.17.14
+Google Cloud SDK 584.0.0
+```
+
+## Paso 38 — Integrar el inventory automático en el Makefile
+
+Se añadió el target `inventory` y los targets principales de Ansible pasaron a
+depender de él. `make ping`, `make deploy`, `make compose-config`, `make up`,
+`make down`, `make ps` y `make logs` regeneran automáticamente
+`ansible/inventory/hosts.ini` antes de conectarse a las VMs.
+
+La prueba confirmó que primero se ejecuta `scripts/generate_inventory.sh` y
+después Ansible alcanza correctamente `cloud1` y `cloud2`.
+
+## Paso 39 — Validar el flujo end-to-end desde el contenedor portable
+
+El playbook completo se ejecutó desde `cloud1-tools` contra las dos VMs y
+terminó sin errores:
+
+```text
+cloud1 : ok=30 changed=1 unreachable=0 failed=0 skipped=2
+cloud2 : ok=30 changed=1 unreachable=0 failed=0 skipped=2
+```
+
+Después se volvió a ejecutar el flujo desde el contenedor para validar la
+idempotencia:
+
+```text
+cloud1 : ok=30 changed=0 unreachable=0 failed=0 skipped=2
+cloud2 : ok=30 changed=0 unreachable=0 failed=0 skipped=2
+```
+
+Esto confirma que el entorno portable funciona de extremo a extremo y que el
+deployment sigue siendo idempotente ejecutado desde Docker.
+
 ## Estado actual de las validaciones obligatorias
 
 Las validaciones principales del subject quedaron completadas:
@@ -1354,11 +1520,14 @@ relevantes son `22`, `80` y `443`.
 
 | Elemento | Estado |
 |---|---|
-| Terraform, provider y variables | IMPLEMENTADO |
-| VM y firewall 22/80/443 | IMPLEMENTADO |
-| Output de IP pública | IMPLEMENTADO |
-| Inventory y conexión SSH | IMPLEMENTADO |
-| Role Docker | IMPLEMENTADO |
+| Terraform, provider y variables | IMPLEMENTADO/VERIFICADO |
+| Backend remoto GCS | IMPLEMENTADO/VERIFICADO |
+| VM y firewall 22/80/443 | IMPLEMENTADO/VERIFICADO |
+| Outputs de IP pública de ambas VMs | IMPLEMENTADO/VERIFICADO |
+| Inventory automático desde Terraform | IMPLEMENTADO/VERIFICADO |
+| SSH parametrizable | IMPLEMENTADO/VERIFICADO |
+| Inventory y conexión SSH | IMPLEMENTADO/VERIFICADO |
+| Role Docker | IMPLEMENTADO/VERIFICADO |
 | Role deployment | IMPLEMENTADO/VERIFICADO |
 | `/opt/cloud-1` y estructura remota | IMPLEMENTADO |
 | Docker Compose | IMPLEMENTADO |
@@ -1381,6 +1550,9 @@ relevantes son `22`, `80` y `443`.
 | Instalación automática sobre datos totalmente nuevos | IMPLEMENTADO/VERIFICADO |
 | Acceso como root exigido por el subject | IMPLEMENTADO/VERIFICADO |
 | Despliegue paralelo en varios servidores | IMPLEMENTADO/VERIFICADO |
+| Contenedor portable `cloud1-tools` | IMPLEMENTADO/VERIFICADO |
+| Deployment completo desde el contenedor portable | IMPLEMENTADO/VERIFICADO |
+| Idempotencia desde el contenedor portable | IMPLEMENTADO/VERIFICADO |
 | IP estática | MEJORA FUTURA |
 | VPC propia | MEJORA FUTURA |
 | Backups | MEJORA FUTURA |
@@ -1394,14 +1566,12 @@ relevantes son `22`, `80` y `443`.
 Los requisitos principales ya están implementados y validados. Las mejoras
 opcionales siguientes quedan fuera del flujo principal:
 
-1. Migrar el Terraform State a un backend remoto, por ejemplo GCS.
-2. Automatizar el descubrimiento de IPs para evitar editar manualmente el
-   inventory.
-3. Valorar una IP estática.
-4. Crear una VPC propia.
-5. Añadir backups.
-6. Añadir monitorización.
-7. Añadir CI/CD.
+1. Valorar una IP estática.
+2. Crear una VPC propia.
+3. Añadir backups.
+4. Añadir monitorización.
+5. Añadir CI/CD.
+6. Valorar un gestor de secretos dedicado.
 
 ---
 
@@ -1440,6 +1610,11 @@ opcionales siguientes quedan fuera del flujo principal:
 - Acceso SSH directo como root mediante clave pública.
 - Diagnóstico de permisos por UID entre contenedores.
 - Validación fresh recreando infraestructura con Terraform.
+- Backend remoto GCS.
+- Inventory automático desde outputs de Terraform.
+- Parametrización de usuario y clave SSH.
+- Contenedor portable de herramientas.
+- Regeneración automática del inventory antes de las operaciones Ansible.
 
 ---
 
@@ -1486,9 +1661,9 @@ el sistema confíe por defecto.
 Las validaciones principales del subject ya se completaron: fresh deployment,
 WordPress sobre datos nuevos, acceso root y multi-servidor. Las limitaciones
 actuales son principalmente mejoras de arquitectura: la IP sigue siendo
-efímera, el Terraform State sigue siendo local y el inventory requiere
-actualizar las IPs cuando cambian. Además, un gestor de secretos dedicado sería
-una mejora frente al `.env` local ignorado por Git.
+efímera y el inventory debe regenerarse cuando cambian las IPs. Además, un
+gestor de secretos dedicado sería una mejora frente al `.env` local ignorado
+por Git.
 
 ---
 
@@ -1501,5 +1676,5 @@ https://github.com/Augustojrl92/cloud-1
 Rama actual:
 
 ```text
-master
+portability
 ```
