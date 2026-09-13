@@ -67,3 +67,10 @@
     owner: root
     group: root
     mode: "0644"
+
+# Autoriza la clave SSH de la máquina de control para acceso directo como root.
+- name: Autorizar clave SSH para root
+  ansible.posix.authorized_key:
+    user: root
+    state: present
+    key: "{{ lookup('ansible.builtin.file', lookup('ansible.builtin.env', 'HOME') + '/.ssh/google_compute_engine.pub') }}"
