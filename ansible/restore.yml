@@ -1,0 +1,7 @@
+---
+- name: Restore de Cloud-1
+  hosts: cloud2
+  become: true
+
+  roles:
+    - restore

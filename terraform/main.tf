@@ -81,6 +81,11 @@ resource "google_compute_instance" "cloud1_vm_2" {
   zone                      = var.zone
   allow_stopping_for_update = true
 
+  service_account {
+    email  = google_service_account.cloud1_restore.email
+    scopes = ["cloud-platform"]
+  }
+
   boot_disk {
     initialize_params {
       image = "ubuntu-os-cloud/ubuntu-2204-lts"
@@ -195,4 +200,15 @@ resource "google_storage_bucket_iam_member" "backup_viewer" {
   bucket = google_storage_bucket.cloud1_backups.name
   role   = "roles/storage.objectViewer"
   member = "serviceAccount:${google_service_account.cloud1_backup.email}"
+}
+
+resource "google_service_account" "cloud1_restore" {
+  account_id   = "cloud1-restore"
+  display_name = "Cloud-1 Restore Service Account"
+}
+
+resource "google_storage_bucket_iam_member" "restore_viewer" {
+  bucket = google_storage_bucket.cloud1_backups.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.cloud1_restore.email}"
 }

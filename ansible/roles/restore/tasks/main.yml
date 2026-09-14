@@ -1,0 +1,113 @@
+---
+- name: Crear directorio temporal de restore
+  ansible.builtin.file:
+    path: /opt/cloud-1/restore
+    state: directory
+    mode: "0700"
+
+- name: Descargar los backups mas recientes desde GCS
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    BUCKET="gs://cloud-1-506415-backups"
+
+    LATEST_DB=$(gcloud storage ls "${BUCKET}/" \
+      | grep '/mariadb-' \
+      | sort \
+      | tail -n 1)
+
+    LATEST_WP=$(gcloud storage ls "${BUCKET}/" \
+      | grep '/wordpress-' \
+      | sort \
+      | tail -n 1)
+
+    test -n "$LATEST_DB"
+    test -n "$LATEST_WP"
+
+    gcloud storage cp "$LATEST_DB" \
+      /opt/cloud-1/restore/latest-mariadb.sql.gz
+
+    gcloud storage cp "$LATEST_WP" \
+      /opt/cloud-1/restore/latest-wordpress.tar.gz
+  args:
+    executable: /bin/bash
+
+- name: Validar backup de MariaDB
+  ansible.builtin.command:
+    cmd: gzip -t /opt/cloud-1/restore/latest-mariadb.sql.gz
+  changed_when: false
+
+- name: Validar backup de WordPress
+  ansible.builtin.command:
+    cmd: tar -tzf /opt/cloud-1/restore/latest-wordpress.tar.gz
+  changed_when: false
+
+- name: Detener servicios web antes del restore
+  ansible.builtin.command:
+    cmd: docker compose stop nginx wordpress phpmyadmin
+    chdir: /opt/cloud-1
+
+- name: Restaurar MariaDB
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    set -a
+    . /opt/cloud-1/.env
+    set +a
+
+    gzip -dc /opt/cloud-1/restore/latest-mariadb.sql.gz \
+      | docker compose -f /opt/cloud-1/docker-compose.yml exec -T mariadb \
+          mariadb \
+          -u root \
+          -p"$MARIADB_ROOT_PASSWORD"
+  args:
+    executable: /bin/bash
+  no_log: true
+
+- name: Limpiar archivos actuales de WordPress
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm -T --no-deps
+      --entrypoint sh wordpress
+      -c "find /var/www/html -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
+    chdir: /opt/cloud-1
+
+- name: Restaurar archivos de WordPress
+  ansible.builtin.shell: |
+    set -euo pipefail
+
+    gzip -dc /opt/cloud-1/restore/latest-wordpress.tar.gz \
+      | docker compose run --rm -T --no-deps \
+          --entrypoint tar wordpress \
+          -xf - -C /var/www/html
+  args:
+    executable: /bin/bash
+    chdir: /opt/cloud-1
+
+- name: Levantar servicios restaurados
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: /opt/cloud-1
+
+- name: Actualizar URL principal de WordPress para cloud2
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm wordpress-cli
+      wp option update home https://{{ ansible_host }}
+      --path=/var/www/html
+      --allow-root
+    chdir: /opt/cloud-1
+
+- name: Actualizar URL interna de WordPress para cloud2
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm wordpress-cli
+      wp option update siteurl https://{{ ansible_host }}
+      --path=/var/www/html
+      --allow-root
+    chdir: /opt/cloud-1
+
+- name: Reiniciar Nginx para refrescar resolucion de WordPress
+  ansible.builtin.command:
+    cmd: docker compose restart nginx
+    chdir: /opt/cloud-1
