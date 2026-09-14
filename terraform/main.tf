@@ -34,6 +34,11 @@ resource "google_compute_instance" "cloud1_vm" {
   # Permite detener la VM para aplicar cambios de configuración in-place.
   allow_stopping_for_update = true
 
+  service_account {
+    email  = google_service_account.cloud1_backup.email
+    scopes = ["cloud-platform"]
+  }
+
   # Configuración del disco principal de la máquina.
   boot_disk {
     # Parámetros usados para crear el disco de arranque.
@@ -160,4 +165,34 @@ resource "google_compute_firewall" "deny_other_ingress" {
 
   source_ranges = ["0.0.0.0/0"]
   target_tags   = ["cloud1"]
+}
+
+# Bucket separado para las copias de seguridad.
+resource "google_storage_bucket" "cloud1_backups" {
+  name          = "${var.project_id}-backups"
+  location      = var.region
+  force_destroy = false
+
+  uniform_bucket_level_access = true
+
+  versioning {
+    enabled = true
+  }
+}
+
+resource "google_service_account" "cloud1_backup" {
+  account_id   = "cloud1-backup"
+  display_name = "Cloud-1 Backup Service Account"
+}
+
+resource "google_storage_bucket_iam_member" "backup_creator" {
+  bucket = google_storage_bucket.cloud1_backups.name
+  role   = "roles/storage.objectCreator"
+  member = "serviceAccount:${google_service_account.cloud1_backup.email}"
+}
+
+resource "google_storage_bucket_iam_member" "backup_viewer" {
+  bucket = google_storage_bucket.cloud1_backups.name
+  role   = "roles/storage.objectViewer"
+  member = "serviceAccount:${google_service_account.cloud1_backup.email}"
 }

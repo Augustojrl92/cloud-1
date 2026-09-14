@@ -1,0 +1,53 @@
+---
+- name: Crear directorio de backups
+  ansible.builtin.file:
+    path: /opt/cloud-1/backups
+    state: directory
+    mode: "0700"
+
+- name: Crear backup comprimido de MariaDB
+  ansible.builtin.shell: |
+    set -o pipefail
+    set -a
+    . /opt/cloud-1/.env
+    set +a
+
+    FILE="/opt/cloud-1/backups/mariadb-$(date +%Y%m%d-%H%M%S).sql.gz"
+
+    docker compose -f /opt/cloud-1/docker-compose.yml exec -T mariadb \
+      mariadb-dump \
+      -u root \
+      -p"$MARIADB_ROOT_PASSWORD" \
+      --all-databases \
+      | gzip > "$FILE"
+
+    echo "$FILE"
+  args:
+    executable: /bin/bash
+  register: mariadb_backup
+  no_log: true
+
+- name: Crear backup de archivos de WordPress
+  ansible.builtin.shell: |
+    set -o pipefail
+
+    FILE="/opt/cloud-1/backups/wordpress-$(date +%Y%m%d-%H%M%S).tar.gz"
+
+    docker exec cloud1_wordpress \
+      tar -czf - -C /var/www/html . \
+      > "$FILE"
+
+    echo "$FILE"
+  args:
+    executable: /bin/bash
+  register: wordpress_backup
+
+- name: Subir backups nuevos a Google Cloud Storage
+  ansible.builtin.command:
+    cmd: >
+      gcloud storage cp
+      {{ item }}
+      gs://cloud-1-506415-backups/
+  loop:
+    - "{{ mariadb_backup.stdout_lines[-1] }}"
+    - "{{ wordpress_backup.stdout_lines[-1] }}"

@@ -1,0 +1,7 @@
+---
+- name: Backup de Cloud-1
+  hosts: cloud1
+  become: true
+
+  roles:
+    - backup

@@ -2,11 +2,17 @@ PROJECT_ID := cloud-1-506415
 ZONE := us-central1-c
 VM_NAME := cloud-1-vm
 
+ifeq ($(OS),Windows_NT)
+GCLOUD_CONFIG := $(APPDATA)/gcloud
+else
+GCLOUD_CONFIG := $(HOME)/.config/gcloud
+endif
+
 ANSIBLE_DIR := ansible
 INVENTORY := $(ANSIBLE_DIR)/inventory/hosts.ini
 PLAYBOOK := $(ANSIBLE_DIR)/playbook.yml
 
-.PHONY: inventory tools
+.PHONY: inventory tools tools-build
 
 help:
 	@echo "Cloud-1 commands"
@@ -91,9 +97,19 @@ logs: inventory
 	ansible cloud -i $(INVENTORY) -b -m shell \
 		-a "cd /opt/cloud-1 && docker compose logs --tail=100"
 
-tools:
+tools-build:
+	docker build -t cloud1-tools -f tools/Dockerfile .
+
+tools: tools-build
 	docker run --rm -it \
 		-v "$(PWD):/workspace" \
-		-v "$(HOME)/.config/gcloud:/root/.config/gcloud" \
-		-v "$(HOME)/.ssh:/root/.ssh:ro" \
-		cloud1-tools
+		-v "$(GCLOUD_CONFIG):/root/.config/gcloud" \
+		-v "$(HOME)/.ssh:/host-ssh:ro" \
+		cloud1-tools \
+		bash -lc 'mkdir -p /root/.ssh && \
+		          cp /host-ssh/google_compute_engine /root/.ssh/google_compute_engine && \
+		          cp /host-ssh/google_compute_engine.pub /root/.ssh/google_compute_engine.pub && \
+		          chmod 700 /root/.ssh && \
+		          chmod 600 /root/.ssh/google_compute_engine && \
+		          chmod 644 /root/.ssh/google_compute_engine.pub && \
+		          exec bash'
