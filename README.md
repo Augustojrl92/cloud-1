@@ -1895,111 +1895,563 @@ endpoint principal y hace más estable la automatización del despliegue.
 
 ## Paso 42 — Automatizar backups en GCS
 
-Se creó un bucket separado para backups y el playbook independiente
-`ansible/backup.yml`. El role `backup` genera un dump comprimido de todas las
-bases de MariaDB y un archivo comprimido de WordPress, y sube únicamente los
-dos archivos creados en esa ejecución.
+**Objetivo.** Crear copias recuperables de los dos componentes persistentes del
+proyecto: la base de datos MariaDB y los archivos de WordPress.
 
-Validación realizada:
+**Diseño.** El backup se separó del playbook principal para evitar que cada
+despliegue genere una copia nueva. Se crearon:
+
+```text
+ansible/backup.yml
+ansible/roles/backup/tasks/main.yml
+```
+
+El playbook se ejecuta únicamente contra `cloud1`.
+
+**Solución.** En cada ejecución se generan dos archivos con timestamp:
+
+```text
+mariadb-YYYYMMDD-HHMMSS.sql.gz
+wordpress-YYYYMMDD-HHMMSS.tar.gz
+```
+
+El backup de MariaDB contiene todas las bases de datos y se comprime con gzip.
+El backup de WordPress contiene `/var/www/html`. Los archivos se almacenan
+temporalmente en `/opt/cloud-1/backups/` y después se suben a:
+
+```text
+gs://cloud-1-506415-backups/
+```
+
+El role conserva los nombres concretos generados durante la ejecución y sube
+únicamente esos dos ficheros, evitando volver a transferir backups anteriores.
+
+**Seguridad.** La VM principal utiliza la service account `cloud1-backup`.
+Los permisos de acceso al bucket se gestionan con Terraform, por lo que no es
+necesario almacenar credenciales personales dentro de la VM.
+
+**Validación.** Se ejecutó:
+
+```bash
+make backup
+```
+
+Y se comprobó que los dos tipos de archivo aparecían correctamente en GCS:
 
 ```text
 MariaDB   → .sql.gz válido, aproximadamente 694 KiB
 WordPress → .tar.gz válido, aproximadamente 36 MiB
-GCS       → objetos visibles en cloud-1-506415-backups
+GCS       → objetos almacenados correctamente
 ```
+
+**Aprendizaje.** Persistencia y backup son conceptos diferentes. Los volúmenes
+Docker protegen los datos frente a recreaciones de contenedores, pero un backup
+externo permite recuperarlos incluso si se pierde la VM o sus volúmenes.
 
 ## Paso 43 — Implementar restore y Disaster Recovery
 
-Se creó `ansible/restore.yml` y el role `restore`. El playbook descarga los
-backups más recientes desde GCS, valida sus formatos y restaura la base de
-datos y los archivos de WordPress en `cloud2`.
+**Objetivo.** Poder reconstruir la aplicación en una máquina diferente usando
+únicamente los backups almacenados en GCS.
 
-La cuenta `cloud1-restore` solo tiene `roles/storage.objectViewer`, por lo que
-la VM de recuperación no puede escribir ni borrar objetos del bucket.
+**Diseño.** El restore se separó del deployment normal para evitar
+restauraciones accidentales. Se crearon:
+
+```text
+ansible/restore.yml
+ansible/roles/restore/tasks/main.yml
+```
+
+El playbook está limitado a `cloud2`.
+
+**Solución.** El role consulta GCS y selecciona los backups más recientes de:
+
+```text
+mariadb-*.sql.gz
+wordpress-*.tar.gz
+```
+
+Antes de restaurarlos se valida su integridad:
+
+```text
+gzip -t   → valida el dump comprimido
+tar -tzf  → valida el archivo de WordPress
+```
+
+Después el flujo realiza estas operaciones:
+
+1. Descarga los backups en `cloud2`.
+2. Detiene los servicios web necesarios.
+3. Restaura MariaDB.
+4. Restaura los archivos de WordPress.
+5. Levanta nuevamente Docker Compose.
+6. Actualiza `home` y `siteurl` con la IP actual de `cloud2`.
+7. Valida la aplicación recuperada.
+
+**Seguridad.** La VM de recuperación utiliza una identidad distinta:
+
+```text
+cloud1-restore
+```
+
+con únicamente:
+
+```text
+roles/storage.objectViewer
+```
+
+Por tanto, `cloud2` puede leer backups, pero no crear ni borrar objetos.
+
+**Aprendizaje.** Un backup no está realmente verificado hasta demostrar que
+puede restaurarse. Separar las identidades de backup y restore aplica además
+el principio de mínimo privilegio.
 
 ## Paso 44 — Validar restore completo en cloud2
 
-El restore se ejecutó sobre la segunda VM sin tocar la principal. Tras
-restaurar los datos se actualizaron `home` y `siteurl` para la IP de `cloud2`,
-se levantó Compose y se verificó que WordPress recuperó la conexión con
-MariaDB y respondió por HTTPS.
+**Objetivo.** Comprobar de extremo a extremo que los backups permiten recuperar
+la aplicación en otra VM sin modificar `cloud1`.
+
+**Prueba.** Se utilizó `cloud2` como entorno de Disaster Recovery. El restore
+descargó los backups más recientes de MariaDB y WordPress desde GCS. Se
+validaron los archivos antes de restaurarlos y posteriormente se importó la
+base de datos y se recuperó `/var/www/html`.
+
+Después se actualizaron las URLs internas de WordPress:
+
+```text
+home
+siteurl
+```
+
+para apuntar a la IP pública actual de `cloud2`.
+
+**Validación final.**
+
+```text
+Restore WordPress → correcto
+Restore MariaDB   → correcto
+WordPress         → operativo
+MariaDB           → conectado
+HTTPS             → 200 OK
+cloud1            → sin modificaciones
+```
+
+También se comprobó que la identidad de `cloud2` continuaba teniendo acceso
+de solo lectura al bucket.
+
+**Aprendizaje.** Una estrategia de Disaster Recovery debe probar la
+recuperación completa y no limitarse a comprobar que los archivos de backup
+existen.
 
 ## Paso 45 — Añadir healthchecks de Docker
 
-Compose incorporó healthchecks para MariaDB, WordPress, phpMyAdmin y Nginx.
-Además, cAdvisor quedó integrado como servicio local de observabilidad. La
-cadena de arranque usa `condition: service_healthy` para que WordPress y
-phpMyAdmin esperen a MariaDB, y para que Nginx espere a los servicios web.
+**Objetivo.** Distinguir entre un contenedor simplemente ejecutándose y un
+servicio realmente preparado para funcionar.
+
+**Problema.** `docker ps` puede mostrar un contenedor como `Up` aunque la
+aplicación dentro de él todavía no esté disponible o haya fallado.
+
+**Solución.** Se añadieron healthchecks a los servicios principales de Compose:
+
+```text
+MariaDB     → healthcheck.sh --connect --innodb_initialized
+WordPress   → comprobación HTTP mediante PHP
+phpMyAdmin  → comprobación HTTP mediante PHP
+Nginx       → nginx -t
+cAdvisor    → endpoint local de métricas
+```
+
+También se utilizaron dependencias basadas en:
+
+```text
+condition: service_healthy
+```
+
+Así WordPress y phpMyAdmin esperan a que MariaDB esté preparada, y Nginx
+espera a que los servicios web estén saludables antes de iniciarse.
+
+**Validación.** Después del deployment, `docker ps` mostró los servicios
+principales en estado:
+
+```text
+(healthy)
+```
+
+El endpoint de cAdvisor quedó accesible únicamente desde la VM mediante
+`127.0.0.1:8080`.
+
+**Aprendizaje.** `running` y `healthy` no significan lo mismo. Un proceso puede
+seguir activo aunque el servicio que proporciona no esté funcionando
+correctamente.
 
 ## Paso 46 — Instalar Google Cloud Ops Agent con Ansible
 
-Se creó `ansible/monitoring.yml` y el role `monitoring`. Ansible instala el
-Google Cloud Ops Agent, habilita su servicio y configura la recolección de
-métricas Prometheus desde cAdvisor y desde el exporter propio.
+**Objetivo.** Centralizar métricas y logs de la VM en Google Cloud Monitoring y
+Cloud Logging.
 
-Terraform asigna a la identidad de `cloud1` los roles
-`roles/monitoring.metricWriter` y `roles/logging.logWriter`.
+**Solución.** Se crearon:
+
+```text
+ansible/monitoring.yml
+ansible/roles/monitoring/
+```
+
+El role instala Google Cloud Ops Agent, habilita su servicio y mantiene su
+configuración mediante Ansible. La configuración utiliza receivers Prometheus
+para consultar cAdvisor en `127.0.0.1:8080` y el exporter de salud en
+`127.0.0.1:9105`.
+
+Terraform asigna a la service account de `cloud1` los permisos:
+
+```text
+roles/monitoring.metricWriter
+roles/logging.logWriter
+```
+
+Estos permisos permiten escribir métricas y logs sin otorgar privilegios
+administrativos adicionales.
+
+**Validación.** Se ejecutó:
+
+```bash
+make monitoring-cloud1
+```
+
+Y el playbook terminó con:
+
+```text
+failed=0
+```
+
+También se verificaron los procesos internos del agente y la llegada de datos a
+Cloud Monitoring y Cloud Logging.
+
+**Resultado visual.** En Google Cloud se pudieron consultar métricas de CPU,
+memoria, disco, red e I/O de la VM, además de logs recogidos por Ops Agent.
+
+**Aprendizaje.** Instalar un agente no es suficiente: también es necesario
+configurar correctamente IAM para que pueda publicar telemetría.
 
 ## Paso 47 — Crear health checks con Ansible
 
-Se creó `ansible/health.yml` y el role `health`. El chequeo valida contenedores,
-MariaDB, instalación y base de datos de WordPress, HTTPS, uso de disco y uso
-de memoria.
+**Objetivo.** Disponer de una comprobación rápida del estado general de la
+aplicación mediante un único comando.
 
-Los límites operativos actuales de disco y memoria son inferiores al 85 %.
-El acceso corto es:
+**Solución.** Se crearon:
+
+```text
+ansible/health.yml
+ansible/roles/health/tasks/main.yml
+```
+
+El role comprueba:
+
+```text
+Docker health     → contenedores healthy
+MariaDB           → SELECT 1
+WordPress         → wp core is-installed
+Base WordPress    → wp db check
+HTTPS             → curl local
+Disco             → uso inferior al 85 %
+Memoria           → uso inferior al 85 %
+```
+
+Las operaciones que pueden mostrar información sensible utilizan `no_log`
+cuando es necesario.
+
+**Acceso rápido.**
 
 ```bash
 make health-cloud1
 ```
 
+**Validación.** Todas las comprobaciones terminaron correctamente.
+
+**Aprendizaje.** Los healthchecks de Docker validan servicios individuales,
+mientras que un playbook de health permite comprobar el sistema completo desde
+la perspectiva operativa.
+
 ## Paso 48 — Crear uptime check con Terraform
 
-Terraform creó el uptime check `cloud-1-web-uptime`, asociado a la IP estática
-de `cloud-1-vm`, con comprobación HTTP de `/`, respuesta 2XX y periodo de 60
-segundos.
+**Objetivo.** Comprobar la disponibilidad de la web desde fuera de la VM.
+
+**Solución.** Terraform creó:
+
+```text
+cloud-1-web-uptime
+```
+
+asociado a la IP pública estática de `cloud-1-vm`. La comprobación utiliza:
+
+```text
+Protocolo    → HTTP
+Puerto       → 80
+Path         → /
+Respuesta    → 2XX
+Frecuencia   → 60 segundos
+Checkers     → globales
+```
+
+Se utilizó HTTP porque el certificado HTTPS actual es autofirmado y los
+checkers externos no confían en él.
+
+**Validación.** Cloud Monitoring mostró comprobaciones correctas desde varias
+regiones y disponibilidad del 100 % durante la prueba.
+
+**Aprendizaje.** Un healthcheck local demuestra que el servicio funciona dentro
+de la VM; un uptime check externo valida además red, firewall y disponibilidad
+del endpoint desde Internet.
 
 ## Paso 49 — Crear dashboard de Cloud Monitoring con Terraform
 
-Se creó el dashboard `cloud-1-terraform` en `terraform/monitoring.tf`. Incluye
-CPU, memoria usada, disco usado, red, I/O, tablas Running/Healthy y gráficos
-de CPU y memoria por contenedor.
+**Objetivo.** Tener una vista única y reproducible del estado de la VM y de los
+contenedores.
 
-Los filtros de memoria y disco se redujeron a los estados útiles (`used`) y el
-`instance_id` de la VM se referencia dinámicamente desde Terraform.
+**Solución.** Se añadió:
+
+```text
+terraform/monitoring.tf
+```
+
+con el dashboard:
+
+```text
+cloud-1-terraform
+```
+
+Inicialmente se añadieron widgets para:
+
+```text
+CPU de cloud-1-vm
+Memoria
+Uso de disco
+Tráfico de red
+Lectura/escritura de disco
+```
+
+Los filtros utilizan el ID dinámico:
+
+```text
+google_compute_instance.cloud1_vm.instance_id
+```
+
+en lugar de un ID de instancia pegado manualmente. Después se simplificaron
+los gráficos de memoria y disco para evitar series innecesarias:
+
+```text
+Memory     → state="used"
+Disk Usage → /dev/sda1 + state="used"
+```
+
+Posteriormente se añadieron las tablas Running/Healthy y los gráficos de CPU y
+memoria por contenedor mediante consultas PromQL.
+
+**Validación.** Terraform mostró únicamente la modificación esperada del
+dashboard y posteriormente Cloud Monitoring mostró los widgets funcionando.
+
+**Aprendizaje.** Gestionar también el dashboard como código permite
+reconstruir la observabilidad del proyecto y evita depender de configuración
+manual en la consola.
 
 ## Paso 50 — Integrar cAdvisor y métricas Prometheus
 
-cAdvisor se añadió al Compose con el puerto `127.0.0.1:8080:8080` y volúmenes
-del host en solo lectura. Se verificó desde la VM que `/metrics` expone datos
-de CPU, memoria y otros recursos por contenedor.
+**Objetivo.** Obtener métricas independientes para cada contenedor en lugar de
+ver únicamente el consumo agregado de la VM.
+
+**Solución.** Se añadió cAdvisor al `docker-compose.yml`. El endpoint se
+publicó únicamente en:
+
+```text
+127.0.0.1:8080
+```
+
+por lo que no queda accesible desde Internet. cAdvisor monta en modo solo
+lectura los recursos del host necesarios para observar Docker y publica
+métricas Prometheus.
+
+**Validación local.**
+
+```bash
+curl http://127.0.0.1:8080/metrics
+```
+
+devolvió métricas como:
+
+```text
+cadvisor_version_info
+container_cpu_usage_seconds_total
+container_memory_usage_bytes
+```
+
+Después Ops Agent se configuró con un receiver Prometheus que consulta:
+
+```text
+127.0.0.1:8080
+```
+
+**Validación en Cloud Monitoring.** PromQL permitió visualizar por separado:
+
+```text
+cloud1_cadvisor
+cloud1_mariadb
+cloud1_nginx
+cloud1_phpmyadmin
+cloud1_wordpress
+```
+
+Se comprobaron CPU y memoria individualmente por contenedor.
+
+**Aprendizaje.** Mantener el exporter en localhost permite recoger métricas
+sin aumentar la superficie de exposición pública del servidor.
 
 ## Paso 51 — Añadir métricas Running/Healthy por contenedor
 
-Se implementó `docker_health_exporter.py` como un servicio systemd que escucha
-solo en `127.0.0.1:9105`. El exporter consulta `docker inspect` y publica:
+**Objetivo.** Mostrar no solo el consumo de recursos, sino también si cada
+contenedor está ejecutándose y si su healthcheck está pasando.
+
+**Problema.** cAdvisor permite saber que un contenedor existe y consume
+recursos, pero no representa de forma suficientemente clara el estado Docker
+`healthy`/`unhealthy`.
+
+**Solución.** Se creó:
 
 ```text
-cloud1_container_running
-cloud1_container_healthy
+ansible/roles/monitoring/files/docker_health_exporter.py
 ```
 
-Ops Agent recoge ambas métricas mediante un receiver Prometheus dedicado.
+y se instaló como servicio systemd:
+
+```text
+docker-health-exporter.service
+```
+
+El exporter consulta `docker inspect` para los contenedores de Cloud-1 y
+publica en:
+
+```text
+127.0.0.1:9105/metrics
+```
+
+dos métricas propias:
+
+```text
+cloud1_container_running{name="cloud1_nginx"} 1
+cloud1_container_healthy{name="cloud1_nginx"} 1
+```
+
+Interpretación:
+
+```text
+running = 1 → contenedor activo
+running = 0 → contenedor detenido
+
+healthy = 1 → healthcheck correcto
+healthy = 0 → healthcheck fallando
+```
+
+Ops Agent incorpora un segundo receiver Prometheus llamado `docker_health` para
+recoger estas métricas. El servicio systemd se reinicia automáticamente si
+falla.
+
+**Validación.** Cloud Monitoring mostró valores individuales para:
+
+```text
+cloud1_cadvisor
+cloud1_mariadb
+cloud1_nginx
+cloud1_phpmyadmin
+cloud1_wordpress
+```
+
+Los widgets `Containers - Running` y `Containers - Health` se añadieron al
+dashboard mediante Terraform.
+
+**Aprendizaje.** Un contenedor puede estar activo pero no sano. Mantener dos
+métricas separadas permite distinguir ambos tipos de fallo.
 
 ## Paso 52 — Crear y validar alertas Container unhealthy / Container down
 
-Terraform creó y habilitó estas políticas con una duración mínima de 60
-segundos:
+**Objetivo.** Hacer que Cloud Monitoring detecte automáticamente fallos de
+healthcheck o contenedores detenidos.
+
+**Solución.** Terraform creó dos políticas de alerting mediante PromQL:
 
 ```text
-Cloud-1 - Container unhealthy → cloud1_container_healthy == 0
-Cloud-1 - Container down       → cloud1_container_running == 0
+Cloud-1 - Container unhealthy
+cloud1_container_healthy == 0
+duración: 60 s
 ```
 
-La alerta `Container unhealthy` se probó con una alteración temporal y segura
-del exporter sobre cAdvisor, sin detener MariaDB, WordPress ni borrar
-volúmenes. La incidencia se abrió en Cloud Monitoring; después se revirtió la
-prueba y la métrica volvió a `1`.
+y:
+
+```text
+Cloud-1 - Container down
+cloud1_container_running == 0
+duración: 60 s
+```
+
+Las políticas incluyen documentación operativa con comandos de diagnóstico
+como:
+
+```text
+docker ps
+docker inspect <container>
+make health-cloud1
+```
+
+**Prueba controlada.** Para no detener MariaDB ni WordPress se modificó
+temporalmente el exporter para que únicamente cAdvisor reportara:
+
+```text
+cloud1_container_healthy{name="cloud1_cadvisor"} 0
+```
+
+No se detuvo ningún contenedor ni se tocaron volúmenes. Cloud Monitoring
+recibió el valor `0` y, después de mantenerse durante el periodo configurado,
+abrió la incidencia:
+
+```text
+Cloud-1 - Container unhealthy
+Container healthcheck failed
+```
+
+Después se eliminó la modificación temporal, se desplegó de nuevo el exporter
+y cAdvisor volvió a reportar:
+
+```text
+cloud1_container_healthy{name="cloud1_cadvisor"} 1
+```
+
+La alerta dejó de estar abierta y quedó registrada en el historial.
+
+Se realizó una segunda prueba controlada equivalente para:
+
+```text
+cloud1_container_running{name="cloud1_cadvisor"} 0
+```
+
+sin detener realmente el contenedor. La política `Cloud-1 - Container down`
+detectó correctamente la condición. Después se revirtió la prueba y la métrica
+volvió a:
+
+```text
+cloud1_container_running{name="cloud1_cadvisor"} 1
+```
+
+**Resultado.**
+
+```text
+Dashboard por contenedor       → verificado
+Estado Running                 → verificado
+Estado Healthy                 → verificado
+Alerta unhealthy               → verificada
+Alerta container down          → verificada
+Recuperación tras la prueba    → verificada
+```
+
+**Aprendizaje.** Una política de alerting no debe considerarse terminada solo
+porque Terraform la crea correctamente. Es necesario provocar de forma segura
+la condición de fallo, comprobar que se abre la incidencia y verificar también
+la recuperación posterior.
 
 ```mermaid
 timeline
