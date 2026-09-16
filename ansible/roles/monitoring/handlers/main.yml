@@ -1,0 +1,14 @@
+---
+- name: Reiniciar Ops Agent
+  ansible.builtin.systemd:
+    name: google-cloud-ops-agent
+    state: restarted
+
+- name: Recargar systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Reiniciar Docker health exporter
+  ansible.builtin.systemd:
+    name: docker-health-exporter
+    state: restarted

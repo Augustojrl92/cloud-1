@@ -14,12 +14,14 @@ INVENTORY := $(ANSIBLE_DIR)/inventory/hosts.ini
 PLAYBOOK := $(ANSIBLE_DIR)/playbook.yml
 BACKUP_PLAYBOOK := $(ANSIBLE_DIR)/backup.yml
 RESTORE_PLAYBOOK := $(ANSIBLE_DIR)/restore.yml
+MONITORING_PLAYBOOK := $(ANSIBLE_DIR)/monitoring.yml
+HEALTH_PLAYBOOK := $(ANSIBLE_DIR)/health.yml
 
 .PHONY: help \
 	tf-init tf-validate tf-plan tf-apply \
 	vm-start vm-stop vm-start-2 vm-stop-2 vm-start-all vm-stop-all vm-status \
 	status inventory ping ping-cloud1 ping-cloud2 check-cloud1 check-cloud2 deploy deploy-cloud1 deploy-cloud2 \
-	backup restore \
+	backup restore monitoring-cloud1 health health-cloud1 \
 	compose-config up down ps ps-cloud1 ps-cloud2 logs logs-cloud1 logs-cloud2 https-cloud1 \
 	tools tools-build
 
@@ -54,6 +56,11 @@ help:
 	@echo "Backups:"
 	@echo "  make backup"
 	@echo "  make restore"
+	@echo "  make monitoring-cloud1"
+	@echo ""
+	@echo "Health:"
+	@echo "  make health"
+	@echo "  make health-cloud1"
 	@echo ""
 	@echo "Docker:"
 	@echo "  make compose-config"
@@ -152,6 +159,15 @@ backup: inventory
 
 restore: inventory
 	ansible-playbook -i $(INVENTORY) $(RESTORE_PLAYBOOK)
+
+monitoring-cloud1: inventory
+	ansible-playbook -i $(INVENTORY) $(MONITORING_PLAYBOOK)
+
+health: inventory
+	ansible-playbook -i $(INVENTORY) $(HEALTH_PLAYBOOK)
+
+health-cloud1: inventory
+	ansible-playbook -i $(INVENTORY) $(HEALTH_PLAYBOOK) --limit cloud1
 
 compose-config: inventory
 	ansible cloud -i $(INVENTORY) -b -m shell \

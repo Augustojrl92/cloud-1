@@ -1,0 +1,7 @@
+---
+- name: Health check de Cloud-1
+  hosts: cloud1
+  become: true
+
+  roles:
+    - health

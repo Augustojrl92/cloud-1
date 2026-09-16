@@ -1,0 +1,97 @@
+---
+- name: Comprobar si Google Cloud Ops Agent está instalado
+  ansible.builtin.command:
+    cmd: dpkg-query -W -f='${Status}' google-cloud-ops-agent
+  register: ops_agent_installed
+  changed_when: false
+  failed_when: false
+
+- name: Descargar instalador oficial de Google Cloud Ops Agent
+  ansible.builtin.get_url:
+    url: https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh
+    dest: /tmp/add-google-cloud-ops-agent-repo.sh
+    mode: "0755"
+  when: ops_agent_installed.rc != 0
+
+- name: Instalar Google Cloud Ops Agent
+  ansible.builtin.command:
+    cmd: bash /tmp/add-google-cloud-ops-agent-repo.sh --also-install
+  when: ops_agent_installed.rc != 0
+
+- name: Asegurar que Ops Agent está iniciado
+  ansible.builtin.systemd:
+    name: google-cloud-ops-agent
+    state: started
+    enabled: true
+
+- name: Configurar Ops Agent para recoger metricas de cAdvisor
+  ansible.builtin.copy:
+    dest: /etc/google-cloud-ops-agent/config.yaml
+    mode: "0644"
+    content: |
+      metrics:
+        receivers:
+          cadvisor:
+            type: prometheus
+            config:
+              scrape_configs:
+                - job_name: "cadvisor"
+                  scrape_interval: 30s
+                  static_configs:
+                    - targets: ["127.0.0.1:8080"]
+
+          docker_health:
+            type: prometheus
+            config:
+              scrape_configs:
+                - job_name: "docker_health"
+                  scrape_interval: 30s
+                  static_configs:
+                    - targets: ["127.0.0.1:9105"]
+
+        service:
+          pipelines:
+            cadvisor_pipeline:
+              receivers:
+                - cadvisor
+
+            docker_health_pipeline:
+              receivers:
+                - docker_health
+  notify: Reiniciar Ops Agent
+
+- name: Copiar Docker health exporter
+  ansible.builtin.copy:
+    src: docker_health_exporter.py
+    dest: /usr/local/bin/docker_health_exporter.py
+    mode: "0755"
+  notify: Reiniciar Docker health exporter
+
+- name: Crear servicio systemd para Docker health exporter
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/docker-health-exporter.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Cloud-1 Docker Health Exporter
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=simple
+      ExecStart=/usr/bin/python3 /usr/local/bin/docker_health_exporter.py
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  notify:
+    - Recargar systemd
+    - Reiniciar Docker health exporter
+
+- name: Habilitar Docker health exporter
+  ansible.builtin.systemd:
+    name: docker-health-exporter
+    enabled: true
+    state: started
+    daemon_reload: true

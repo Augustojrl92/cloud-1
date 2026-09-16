@@ -5,6 +5,13 @@ services:
     container_name: cloud1_mariadb
     restart: unless-stopped
 
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
     environment:
       MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
       MARIADB_DATABASE: ${MARIADB_DATABASE}
@@ -25,6 +32,17 @@ services:
 
     restart: unless-stopped
 
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "php -r '$$s=@fsockopen(\"127.0.0.1\",80); if (!$$s) exit(1); fclose($$s);'"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
     environment:
       WORDPRESS_DB_HOST: mariadb:3306
       WORDPRESS_DB_NAME: ${MARIADB_DATABASE}
@@ -32,7 +50,8 @@ services:
       WORDPRESS_DB_PASSWORD: ${MARIADB_PASSWORD}
 
     depends_on:
-      - mariadb
+      mariadb:
+        condition: service_healthy
 
     # Guarda los archivos de WordPress de forma persistente.
     volumes:
@@ -73,12 +92,43 @@ services:
 
     restart: unless-stopped
 
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "php -r '$$s=@fsockopen(\"127.0.0.1\",80); if (!$$s) exit(1); fclose($$s);'"
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
     environment:
       PMA_HOST: mariadb
       PMA_PORT: 3306
 
     depends_on:
-      - mariadb
+      mariadb:
+        condition: service_healthy
+
+    networks:
+      - cloud1_network
+
+  # Exporta métricas Prometheus de los contenedores solo dentro de la VM.
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    container_name: cloud1_cadvisor
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
 
     networks:
       - cloud1_network
@@ -90,9 +140,18 @@ services:
 
     restart: unless-stopped
 
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
     depends_on:
-      - wordpress
-      - phpmyadmin
+      wordpress:
+        condition: service_healthy
+      phpmyadmin:
+        condition: service_healthy
 
     ports:
       - "80:80"

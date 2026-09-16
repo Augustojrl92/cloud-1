@@ -1,0 +1,91 @@
+---
+- name: Comprobar estado de los contenedores
+  ansible.builtin.shell: |
+    set -e
+
+    for container in \
+      cloud1_mariadb \
+      cloud1_wordpress \
+      cloud1_phpmyadmin \
+      cloud1_nginx
+    do
+      STATUS=$(docker inspect \
+        --format='{{ "{{" }}.State.Health.Status{{ "}}" }}' \
+        "$container")
+
+      echo "$container: $STATUS"
+
+      test "$STATUS" = "healthy"
+    done
+  args:
+    executable: /bin/bash
+  changed_when: false
+
+- name: Comprobar MariaDB
+  ansible.builtin.command:
+    cmd: >
+      docker exec cloud1_mariadb
+      sh -lc
+      'mariadb
+      -u "$MARIADB_USER"
+      -p"$MARIADB_PASSWORD"
+      "$MARIADB_DATABASE"
+      -e "SELECT 1;"'
+  changed_when: false
+  no_log: true
+
+- name: Comprobar instalacion de WordPress
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm wordpress-cli
+      wp core is-installed
+      --path=/var/www/html
+      --allow-root
+    chdir: /opt/cloud-1
+  changed_when: false
+
+- name: Comprobar conexion de WordPress con MariaDB
+  ansible.builtin.command:
+    cmd: >
+      docker compose run --rm wordpress-cli
+      wp db check
+      --path=/var/www/html
+      --allow-root
+    chdir: /opt/cloud-1
+  changed_when: false
+  no_log: true
+
+- name: Comprobar HTTPS
+  ansible.builtin.command:
+    cmd: curl -kfsS -o /dev/null https://127.0.0.1
+  changed_when: false
+
+- name: Obtener uso del disco raiz
+  ansible.builtin.shell: |
+    df -P / | awk 'NR==2 {gsub("%","",$5); print $5}'
+  args:
+    executable: /bin/bash
+  register: disk_usage
+  changed_when: false
+
+- name: Validar uso del disco
+  ansible.builtin.assert:
+    that:
+      - disk_usage.stdout | int < 85
+    fail_msg: "Uso de disco demasiado alto: {{ disk_usage.stdout }}%"
+    success_msg: "Disco OK: {{ disk_usage.stdout }}%"
+
+- name: Obtener uso de memoria
+  ansible.builtin.shell: |
+    free | awk '/Mem:/ {printf "%.0f", $3/$2 * 100}'
+  args:
+    executable: /bin/bash
+  register: memory_usage
+  changed_when: false
+
+- name: Validar uso de memoria
+  ansible.builtin.assert:
+    that:
+      - memory_usage.stdout | int < 85
+    fail_msg: "Uso de memoria demasiado alto: {{ memory_usage.stdout }}%"
+    success_msg: "Memoria OK: {{ memory_usage.stdout }}%"
