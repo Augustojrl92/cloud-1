@@ -1,17 +1,17 @@
 # Cloud-1
 
 Cloud-1 automatiza el camino desde infraestructura en Google Cloud hasta una
-aplicación web desplegada en contenedores sobre dos VMs remotas. El despliegue
-actual incluye automatización de WordPress, gestión separada de secretos,
-hardening del firewall local, reglas de entrada explícitas en GCP y una VPC
-propia administrada con Terraform.
+aplicación web desplegada en contenedores sobre dos VMs remotas. El proyecto
+incluye infraestructura como código, despliegue reproducible, backups en GCS,
+restauración probada, healthchecks, métricas, dashboard y alertas gestionados
+con Terraform y Ansible.
 
 El proyecto separa responsabilidades en tres capas:
 
 - **Terraform** aprovisiona la infraestructura en Google Cloud.
 - **Ansible** configura la VM y prepara el entorno de despliegue.
-- **Docker Compose** ejecuta la aplicación formada por Nginx, WordPress,
-  MariaDB y phpMyAdmin.
+- **Docker Compose** ejecuta la aplicación y sus componentes de observabilidad:
+  Nginx, WordPress, MariaDB, phpMyAdmin y cAdvisor.
 
 ```mermaid
 flowchart LR
@@ -26,6 +26,15 @@ flowchart LR
     SSH --> Ansible["Ansible"]
     Ansible --> Docker["Docker Engine + Compose"]
     Docker --> App["Nginx + WordPress + MariaDB + phpMyAdmin"]
+    Docker --> CAdvisor["cAdvisor · localhost:8080"]
+    CAdvisor --> OpsAgent["Google Cloud Ops Agent"]
+    VM1 --> Exporter["Docker Health Exporter · localhost:9105"]
+    Exporter --> OpsAgent
+    VM1 --> Backup["backup.yml"]
+    Backup --> GCS["GCS backups bucket"]
+    GCS --> Restore["restore.yml → cloud2"]
+    OpsAgent --> Monitoring["Cloud Monitoring"]
+    Monitoring --> Dashboard["Dashboard + Alertas"]
 ```
 
 ## Vista rápida
@@ -50,8 +59,12 @@ flowchart LR
 | IP estática | Dirección regional reservada para `cloud-1-vm` | Implementado/verificado |
 | Idempotencia | Playbook repetido sin cambios | Implementado/verificado |
 | GCS remote state | Backend remoto compartido de Terraform | Implementado/verificado |
-| Inventory automático | Generación desde outputs de Terraform | Implementado/verificado |
+| Inventory automático | Consulta directa de IPs en GCP | Implementado/verificado |
 | Entorno portable | Docker con Terraform, Ansible y gcloud | Implementado/verificado |
+| Backups / DR | MariaDB + WordPress en GCS y restore en `cloud2` | Implementado/verificado |
+| Healthchecks | Docker Compose + role `health` | Implementado/verificado |
+| Monitorización | Ops Agent + cAdvisor + exporter Prometheus | Implementado/verificado |
+| Alerting | Container unhealthy / Container down | Implementado/verificado |
 
 Terraform aplica **Infrastructure as Code**: la infraestructura se expresa en
 archivos versionables, revisables y repetibles. Ansible aplica **Configuration
@@ -128,6 +141,7 @@ ejecuta `docker compose up -d`, reinicia Nginx si Compose recrea servicios y usa
 cloud-1/
 ├── Makefile
 ├── .gitignore
+├── .gitattributes
 ├── README.md
 ├── cloud-1.pdf
 ├── scripts/
@@ -138,22 +152,35 @@ cloud-1/
 │   ├── providers.tf
 │   ├── variables.tf
 │   ├── main.tf
+│   ├── monitoring.tf
 │   ├── outputs.tf
 │   └── .terraform.lock.hcl
 ├── ansible/
 │   ├── inventory/
-│   │   └── hosts.ini
+│   │   └── hosts.ini              # generado; no versionar
 │   ├── playbook.yml
+│   ├── backup.yml
+│   ├── restore.yml
+│   ├── monitoring.yml
+│   ├── health.yml
 │   └── roles/
 │       ├── docker/
 │       │   └── tasks/
 │       │       └── main.yml
 │       ├── deployment/
-│       │   └── tasks/
-│       │       └── main.yml
-│       └── security/
-│           └── tasks/
-│               └── main.yml
+│       │   └── tasks/main.yml
+│       ├── security/
+│       │   └── tasks/main.yml
+│       ├── backup/
+│       │   └── tasks/main.yml
+│       ├── restore/
+│       │   └── tasks/main.yml
+│       ├── health/
+│       │   └── tasks/main.yml
+│       └── monitoring/
+│           ├── tasks/main.yml
+│           ├── handlers/main.yml
+│           └── files/docker_health_exporter.py
 └── docker/
     ├── docker-compose.yml
     └── nginx/
@@ -164,19 +191,16 @@ cloud-1/
 
 El `Makefile` proporciona accesos rápidos para operaciones frecuentes:
 
-- `make tf-init`
-- `make tf-validate`
-- `make tf-plan`
-- `make tf-apply`
-- `make vm-start`
-- `make vm-stop`
-- `make vm-status`
-- `make inventory`
-- `make ping`
-- `make deploy`
-- `make ps`
-- `make logs`
-- `make tools`
+| Grupo | Targets principales |
+|---|---|
+| Terraform | `tf-init`, `tf-validate`, `tf-plan`, `tf-apply` |
+| VMs | `vm-start`, `vm-stop`, `vm-start-2`, `vm-stop-2`, `vm-start-all`, `vm-stop-all`, `status` |
+| Conectividad | `inventory`, `ping`, `check-cloud1`, `check-cloud2` |
+| Despliegue | `deploy`, `deploy-cloud1`, `deploy-cloud2` |
+| DR | `backup`, `restore` |
+| Observabilidad | `monitoring-cloud1`, `health`, `health-cloud1` |
+| Operación | `ps`, `ps-cloud1`, `ps-cloud2`, `logs`, `logs-cloud1`, `logs-cloud2`, `https-cloud1` |
+| Portable | `tools-build`, `tools` |
 
 No es un requisito del subject; se incluye como herramienta de comodidad para
 desarrollo y evaluación.
@@ -193,6 +217,21 @@ terraform -chdir=terraform plan
 ./scripts/generate_inventory.sh
 make ping
 make deploy
+make backup
+make health-cloud1
+```
+
+Un flujo habitual de operación es:
+
+```mermaid
+flowchart LR
+    Start["Cambio en el repo"] --> Fmt["terraform fmt / validate"]
+    Fmt --> Plan["terraform plan"]
+    Plan --> Apply["terraform apply"]
+    Apply --> Inv["make inventory"]
+    Inv --> Deploy["make deploy-cloud1"]
+    Deploy --> Health["make health-cloud1"]
+    Health --> Backup["make backup"]
 ```
 
 Los certificados TLS **no se guardan en el repositorio**. Ansible los genera
@@ -232,7 +271,8 @@ Cada bloque define `description`, `type` y `default`. Usar
 
 Define una VPC, una subred regional, dos instancias
 (`google_compute_instance.cloud1_vm` y
-`google_compute_instance.cloud1_vm_2`) y cuatro recursos de firewall.
+`google_compute_instance.cloud1_vm_2`), cuatro recursos de firewall, un bucket
+de backups y las identidades de backup/restore.
 
 `google_compute_instance.cloud1_vm` es la dirección lógica de Terraform;
 `cloud-1-vm` es el nombre real dentro de Google Cloud.
@@ -291,6 +331,32 @@ como `default-allow-rdp` para `3389`.
 La base de datos no necesita una regla pública porque permanece en la red
 interna de Docker.
 
+### Identidades y bucket de backups
+
+Terraform crea el bucket regional:
+
+```text
+gs://cloud-1-506415-backups/
+```
+
+con versionado y acceso uniforme. Las identidades siguen el principio de
+mínimo privilegio:
+
+```mermaid
+flowchart LR
+    VM1["cloud-1-vm"] --> BackupSA["cloud1-backup"]
+    BackupSA -->|objectCreator + objectViewer| Bucket["GCS backups"]
+    BackupSA -->|monitoring.metricWriter| Metrics["Cloud Monitoring"]
+    BackupSA -->|logging.logWriter| Logs["Cloud Logging"]
+    VM2["cloud-1-vm-2"] --> RestoreSA["cloud1-restore"]
+    RestoreSA -->|objectViewer únicamente| Bucket
+```
+
+`cloud1-backup` puede crear y leer objetos, pero no borrarlos. `cloud1-restore`
+solo puede leerlos. Ambas VMs reciben su service account directamente en
+Terraform con scope `cloud-platform`; los permisos efectivos los limitan los
+roles IAM anteriores.
+
 ## `terraform/outputs.tf`
 
 El output `public_ip` devuelve la IP pública conocida por Terraform:
@@ -302,13 +368,45 @@ google_compute_instance.cloud1_vm.network_interface[0].access_config[0].nat_ip
 La expresión recorre el recurso, la primera interfaz de red, la primera
 configuración de acceso y finalmente `nat_ip`.
 
-El output `public_ip_2` hace lo mismo para `cloud1_vm_2`. Estos dos outputs
-permiten generar el inventory sin copiar manualmente las direcciones públicas.
+El output `public_ip_2` hace lo mismo para `cloud1_vm_2`. Los outputs sirven
+para inspección y diagnóstico. El inventory operativo no depende de ellos:
+`scripts/generate_inventory.sh` consulta directamente la IP actual de cada VM
+con `gcloud compute instances describe`.
 
 `cloud1_vm` utiliza la dirección regional estática `cloud1-static-ip`, por lo
 que su IP pública permanece estable. La IP pública de `cloud1_vm_2` sigue
 siendo efímera y puede cambiar al detener y volver a arrancar esa VM; el
 inventory se regenera automáticamente para recoger cualquier cambio.
+
+## `terraform/monitoring.tf`
+
+Centraliza los recursos de observabilidad gestionados por Terraform:
+
+- Uptime check `cloud-1-web-uptime` contra la IP estática de `cloud-1-vm`.
+- Dashboard `cloud-1-terraform`.
+- Política `Cloud-1 - Container unhealthy` para
+  `cloud1_container_healthy == 0` durante `60s`.
+- Política `Cloud-1 - Container down` para
+  `cloud1_container_running == 0` durante `60s`.
+
+El dashboard combina métricas del Ops Agent y consultas Prometheus:
+
+```mermaid
+flowchart TB
+    Host["cloud-1-vm"] --> Agent["Ops Agent"]
+    Agent --> HostMetrics["CPU · memoria · disco · red · I/O"]
+    CAdvisor["cAdvisor :8080"] --> ContainerMetrics["CPU/RAM por contenedor"]
+    Exporter["Docker Health Exporter :9105"] --> StateMetrics["Running / Healthy"]
+    CAdvisor --> Agent
+    Exporter --> Agent
+    HostMetrics --> Dashboard["Dashboard cloud-1-terraform"]
+    ContainerMetrics --> Dashboard
+    StateMetrics --> Dashboard
+    StateMetrics --> Alerts["Alertas unhealthy / down"]
+```
+
+Los filtros de memoria y disco se limitan respectivamente a
+`metric.labels.state="used"` y a `/dev/sda1` para evitar series irrelevantes.
 
 ## `.terraform` y `.terraform.lock.hcl`
 
@@ -344,15 +442,18 @@ Define:
 - El usuario SSH.
 - La clave privada usada para la conexión.
 
-Las IPs públicas se obtienen automáticamente desde Terraform. El script
-`scripts/generate_inventory.sh` usa los outputs `public_ip` y `public_ip_2`
-con `terraform output -raw` y genera las entradas de `hosts.ini`. El usuario
-SSH se puede parametrizar con `CLOUD1_SSH_USER` y la clave con
+Las IPs públicas se consultan directamente en GCP. El script
+`scripts/generate_inventory.sh` ejecuta `gcloud compute instances describe`
+para `cloud-1-vm` y `cloud-1-vm-2`, y genera las entradas de `hosts.ini` solo
+cuando la VM tiene una IP disponible. No depende de `terraform output -raw`.
+El usuario SSH se puede parametrizar con `CLOUD1_SSH_USER` y la clave con
 `CLOUD1_SSH_KEY`.
 
 La IP de `cloud2` puede cambiar al reiniciar la VM, por lo que el inventory se
-regenera después de obtener nuevos outputs. La IP de `cloud1` permanece
-estable gracias a `cloud1-static-ip`.
+regenera antes de cada operación. Si una VM está apagada o no tiene IP, el
+script omite su línea para evitar entradas inválidas como
+`cloud2 ansible_host=`. La IP de `cloud1` permanece estable gracias a
+`cloud1-static-ip`.
 
 Además, el usuario SSH puede variar según el equipo desde el que se trabaje.
 Por ejemplo, `gcloud compute ssh` puede registrar automáticamente una clave
@@ -453,6 +554,38 @@ El role `security` está implementado. Instala y activa UFW con política
 permite `22/tcp`, `80/tcp` y `443/tcp`. También asegura los permisos de los
 archivos sensibles: `.env` y `key.pem` con `0600`, y `cert.pem` con `0644`.
 
+## Flujos Ansible independientes
+
+Las operaciones de producción y las operaciones auxiliares están separadas en
+playbooks pequeños, con un único objetivo por flujo:
+
+| Playbook | Host objetivo | Role | Función |
+|---|---|---|---|
+| `playbook.yml` | `cloud` | `docker`, `deployment`, `security` | Despliegue principal |
+| `backup.yml` | `cloud1` | `backup` | Crear y subir backups |
+| `restore.yml` | `cloud2` | `restore` | Recuperar desde GCS |
+| `monitoring.yml` | `cloud1` | `monitoring` | Ops Agent y exporters |
+| `health.yml` | `cloud1` | `health` | Validación técnica |
+
+Esta separación evita que un despliegue normal ejecute accidentalmente un
+restore o un backup. Los roles relacionados quedan organizados así:
+
+```text
+ansible/
+├── backup.yml
+├── restore.yml
+├── monitoring.yml
+├── health.yml
+└── roles/
+    ├── backup/tasks/main.yml
+    ├── restore/tasks/main.yml
+    ├── health/tasks/main.yml
+    └── monitoring/
+        ├── files/docker_health_exporter.py
+        ├── handlers/main.yml
+        └── tasks/main.yml
+```
+
 ---
 
 # Portabilidad
@@ -472,9 +605,14 @@ El state local se migró al backend remoto y se validó con `terraform state lis
 
 ## Inventory automático
 
-`scripts/generate_inventory.sh` obtiene las IPs actuales mediante los outputs
-`public_ip` y `public_ip_2` de Terraform y genera
-`ansible/inventory/hosts.ini` con `cloud1` y `cloud2`.
+`scripts/generate_inventory.sh` consulta directamente la API de Compute Engine
+con `gcloud compute instances describe` y genera
+`ansible/inventory/hosts.ini` con `cloud1` y `cloud2` cuando tienen IP pública.
+Así el flujo funciona también con la IP efímera de `cloud2`, sin depender de
+outputs de Terraform ni de copiar direcciones manualmente.
+
+El archivo es generado y no debe formar parte de los commits; se regenera con
+`make inventory` antes de las operaciones Ansible.
 
 El script admite las variables `CLOUD1_SSH_USER` y `CLOUD1_SSH_KEY` para evitar
 fijar el usuario y la clave SSH al equipo desde el que se trabaja.
@@ -515,9 +653,9 @@ make deploy
 
 ## Servicios
 
-El `docker-compose.yml` actual define cinco servicios, aunque
-`wordpress-cli` usa un perfil auxiliar y no queda ejecutándose como servicio
-público permanente.
+El `docker-compose.yml` actual define seis servicios: MariaDB, WordPress,
+phpMyAdmin, Nginx, cAdvisor y `wordpress-cli`. Este último usa un perfil
+auxiliar y no queda ejecutándose como servicio público permanente.
 
 ### MariaDB
 
@@ -548,6 +686,23 @@ Responsabilidad:
 
 phpMyAdmin tampoco publica directamente su puerto `80`.
 
+### cAdvisor
+
+cAdvisor recoge métricas Prometheus del runtime de Docker, incluyendo CPU,
+memoria, red e I/O por contenedor. Se ejecuta como `cloud1_cadvisor` dentro de
+la red `cloud1_network` y monta en solo lectura los recursos del host
+necesarios para observar Docker.
+
+Su endpoint está publicado únicamente en localhost:
+
+```text
+127.0.0.1:8080 → cAdvisor /metrics
+```
+
+Por tanto, cAdvisor no queda expuesto directamente a Internet. El Google Cloud
+Ops Agent consulta ese endpoint desde la propia VM y envía las métricas a Cloud
+Monitoring.
+
 ### Nginx
 
 Responsabilidad:
@@ -576,6 +731,25 @@ Durante la validación fresh se detectó que `wordpress:cli` utiliza `www-data`
 con UID `82`, mientras que el contenedor principal de WordPress utiliza UID
 `33`. Para compartir el volumen con permisos coherentes, `wordpress-cli` se
 ejecuta con `user: "33:33"`.
+
+### Dependencias y healthchecks
+
+Los servicios principales incorporan healthchecks internos. WordPress y
+phpMyAdmin esperan a que MariaDB esté `healthy`, y Nginx espera a que los
+servicios web estén preparados:
+
+```mermaid
+flowchart TD
+    DB[MariaDB<br/>healthcheck.sh] -->|service_healthy| WP[WordPress<br/>PHP socket check]
+    DB -->|service_healthy| PMA[phpMyAdmin<br/>PHP socket check]
+    WP -->|service_healthy| NG[Nginx<br/>nginx -t]
+    PMA -->|service_healthy| NG
+    CAD[cAdvisor<br/>127.0.0.1:8080/metrics] --> OA[Ops Agent]
+```
+
+La disponibilidad HTTP/HTTPS se valida además desde fuera de la VM, porque
+el healthcheck de Nginx valida la configuración local y no sustituye una
+comprobación del endpoint público.
 
 ---
 
@@ -648,6 +822,209 @@ HTTPS /phpmyadmin/  → phpMyAdmin operativo
 ```
 
 `curl -k` se usa únicamente porque el certificado actual es autofirmado.
+
+---
+
+# Backups y Disaster Recovery
+
+Cloud-1 cuenta con un flujo de backup y recuperación independiente del
+despliegue principal. Los backups se ejecutan sobre `cloud1` mediante el role
+`backup` y se almacenan en un bucket GCS separado:
+
+```text
+gs://cloud-1-506415-backups/
+```
+
+El bucket tiene versionado y acceso uniforme por IAM. En cada ejecución se
+generan dos archivos locales en `/opt/cloud-1/backups` con permisos `0700`:
+
+```text
+mariadb-YYYYMMDD-HHMMSS.sql.gz
+wordpress-YYYYMMDD-HHMMSS.tar.gz
+```
+
+El backup de MariaDB contiene todas las bases de datos (`--all-databases`). El
+backup de WordPress contiene todo `/var/www/html`. El playbook conserva los
+nombres exactos generados durante esa ejecución y sube únicamente esos dos
+archivos, evitando volver a transferir backups antiguos.
+
+```mermaid
+flowchart LR
+    B[make backup] --> A[Ansible backup.yml]
+    A --> DB[mariadb-dump<br/>SQL comprimido]
+    A --> WP[WordPress<br/>tar.gz de /var/www/html]
+    DB --> L[/opt/cloud-1/backups/]
+    WP --> L
+    L --> G[(GCS backups<br/>versionado)]
+```
+
+## Identidades y mínimo privilegio
+
+Terraform crea dos identidades separadas:
+
+| VM | Service Account | Permisos relevantes |
+|---|---|---|
+| `cloud-1-vm` (`cloud1`) | `cloud1-backup` | Crear/leer objetos del bucket, escribir métricas y logs |
+| `cloud-1-vm-2` (`cloud2`) | `cloud1-restore` | Solo leer objetos del bucket |
+
+La identidad de restore no puede crear ni borrar objetos. No se utilizan
+credenciales personales dentro de las VMs: las operaciones GCS usan la
+identidad adjunta a cada instancia.
+
+## Restore y recuperación ante desastre
+
+`ansible/restore.yml` está limitado a `cloud2`. El flujo descarga desde GCS el
+backup más reciente de MariaDB y WordPress, valida ambos archivos y restaura
+los datos sobre la segunda VM:
+
+```mermaid
+flowchart TD
+    G[(GCS backups)] -->|objectViewer| C2[cloud2]
+    C2 --> D[Descargar últimos .sql.gz y .tar.gz]
+    D --> V1[gzip -t]
+    D --> V2[tar -tzf]
+    V1 --> RDB[Restaurar MariaDB]
+    V2 --> RWP[Limpiar y restaurar /var/www/html]
+    RDB --> U[Levantar Compose]
+    RWP --> U
+    U --> URL[Actualizar home y siteurl a la IP de cloud2]
+    URL --> H[Validar HTTPS y WordPress]
+```
+
+La recuperación se probó de extremo a extremo en `cloud2`: los archivos fueron
+válidos, WordPress recuperó la conexión con MariaDB y el endpoint HTTPS
+respondió correctamente. El flujo no elimina objetos del bucket ni modifica
+la VM principal.
+
+Comandos habituales:
+
+```bash
+make backup
+make restore
+make ps-cloud2
+make logs-cloud2
+```
+
+`make restore` requiere que `cloud2` tenga IP pública disponible, porque el
+inventory se genera dinámicamente antes de ejecutar Ansible.
+
+# Observabilidad y alerting
+
+La observabilidad combina métricas del host, métricas de contenedores,
+healthchecks locales, dashboard gestionado por Terraform y alertas de Cloud
+Monitoring.
+
+```mermaid
+flowchart LR
+    subgraph VM[cloud-1-vm / cloud1]
+        D[Docker Compose]
+        C[cAdvisor<br/>127.0.0.1:8080]
+        E[Docker Health Exporter<br/>127.0.0.1:9105]
+        O[Google Cloud Ops Agent]
+        D --> C
+        D --> E
+        C --> O
+        E --> O
+    end
+
+    O --> M[Cloud Monitoring]
+    M --> DB[Dashboard<br/>cloud-1-terraform]
+    M --> AL1[Container unhealthy]
+    M --> AL2[Container down]
+    M --> UP[Uptime check HTTPS/HTTP]
+    O --> LG[Cloud Logging]
+```
+
+## Google Cloud Ops Agent
+
+El role `monitoring` instala y configura Google Cloud Ops Agent mediante
+Ansible. Su configuración recoge dos endpoints Prometheus locales:
+
+| Receiver | Endpoint | Datos |
+|---|---|---|
+| `cadvisor` | `127.0.0.1:8080` | CPU, memoria, red e I/O por contenedor |
+| `docker_health` | `127.0.0.1:9105` | Estado `running` y `healthy` de cada contenedor |
+
+La service account `cloud1-backup` tiene además los roles mínimos necesarios
+para que Ops Agent publique datos:
+
+```text
+roles/monitoring.metricWriter
+roles/logging.logWriter
+```
+
+El agente envía métricas y logs a los servicios gestionados de Google Cloud.
+No se abre ningún puerto nuevo en el firewall: los exporters escuchan solo en
+`127.0.0.1`.
+
+Despliegue y comprobación:
+
+```bash
+make monitoring-cloud1
+
+ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+  -a 'systemctl status google-cloud-ops-agent --no-pager'
+```
+
+## cAdvisor y Docker Health Exporter
+
+cAdvisor publica métricas Prometheus de los contenedores. El exporter propio,
+instalado como `docker-health-exporter.service`, consulta `docker inspect` y
+expone:
+
+```text
+cloud1_container_running{name="cloud1_nginx"} 1
+cloud1_container_healthy{name="cloud1_nginx"} 1
+```
+
+Las métricas se generan para MariaDB, WordPress, Nginx, phpMyAdmin y cAdvisor.
+El valor `1` significa activo/sano y `0` significa detenido/no sano. El
+servicio se reinicia automáticamente mediante systemd si falla.
+
+Comprobaciones directas desde Ansible:
+
+```bash
+ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+  -a 'curl -s http://127.0.0.1:8080/metrics | head -30'
+
+ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+  -a 'curl -s http://127.0.0.1:9105/metrics'
+```
+
+## Dashboard Terraform
+
+`terraform/monitoring.tf` mantiene el dashboard `cloud-1-terraform`. Sus
+widgets cubren:
+
+- CPU de `cloud-1-vm`.
+- Memoria usada, filtrada por `state="used"`.
+- Disco usado de `/dev/sda1`, filtrado por `state="used"`.
+- Tráfico de red y lectura/escritura de disco.
+- Tabla de contenedores activos (`cloud1_container_running`).
+- Tabla de contenedores sanos (`cloud1_container_healthy`).
+- CPU por contenedor mediante PromQL.
+- Memoria por contenedor mediante PromQL.
+
+Los filtros del host utilizan el `instance_id` dinámico de Terraform, no un
+identificador pegado manualmente. Las consultas de contenedores agrupan por el
+label `name`, de modo que el dashboard muestra cada servicio por separado.
+
+## Uptime check y alertas
+
+Terraform también mantiene un uptime check global para `cloud-1-vm`, usando la
+IP estática reservada y validando la respuesta 2XX de `/` cada 60 segundos.
+
+Las dos políticas PQL están habilitadas y se probaron realmente:
+
+| Política | Consulta | Duración |
+|---|---|---|
+| `Cloud-1 - Container unhealthy` | `cloud1_container_healthy == 0` | 60 s |
+| `Cloud-1 - Container down` | `cloud1_container_running == 0` | 60 s |
+
+La primera se validó con una prueba controlada sobre cAdvisor, sin detener
+MariaDB ni WordPress. Después se revirtió el exporter y se comprobó que la
+métrica volvió a `1`. La segunda quedó creada en Terraform para detectar un
+contenedor que deje de estar ejecutándose.
 
 ---
 
@@ -1348,10 +1725,10 @@ local aislado, aunque el state continúa sin versionarse en Git.
 **Objetivo.** Generar las IPs de `cloud1` y `cloud2` sin editar manualmente el
 inventory.
 
-**Solución.** Se añadió el output `public_ip_2` y el script
-`scripts/generate_inventory.sh`, que obtiene ambos outputs de Terraform y
-genera `ansible/inventory/hosts.ini`. La conectividad se validó con `make
-ping` y ambas VMs devolvieron `pong`.
+**Solución.** Se añadió el script `scripts/generate_inventory.sh`, que consulta
+directamente GCP mediante `gcloud compute instances describe` y genera
+`ansible/inventory/hosts.ini` solo para las VMs con IP pública disponible. La
+conectividad se validó con `make ping` y ambas VMs devolvieron `pong`.
 
 El script permite parametrizar el usuario y la clave con `CLOUD1_SSH_USER` y
 `CLOUD1_SSH_KEY`.
@@ -1470,7 +1847,7 @@ network_interface {
 La segunda VM mantiene una IP pública efímera, ya que se utiliza principalmente
 para validar despliegues multi-servidor.
 
-Estado verificado:
+Estado verificado en ese momento (la IP de `cloud2` es un ejemplo histórico):
 
 ```text
 cloud-1-vm
@@ -1494,8 +1871,9 @@ La dirección reservada quedó en estado:
 cloud1-static-ip → IN_USE
 ```
 
-Después del cambio, el inventory de Ansible se regeneró automáticamente desde
-los outputs de Terraform.
+Después del cambio, el inventory de Ansible se regeneró automáticamente
+consultando directamente GCP. Así la IP estática de `cloud1` permanece estable
+y la IP efímera de `cloud2` se descubre en cada ejecución.
 
 Validación:
 
@@ -1515,6 +1893,131 @@ HTTPS → 200 OK
 **Aprendizaje.** Una IP pública estática elimina cambios inesperados en el
 endpoint principal y hace más estable la automatización del despliegue.
 
+## Paso 42 — Automatizar backups en GCS
+
+Se creó un bucket separado para backups y el playbook independiente
+`ansible/backup.yml`. El role `backup` genera un dump comprimido de todas las
+bases de MariaDB y un archivo comprimido de WordPress, y sube únicamente los
+dos archivos creados en esa ejecución.
+
+Validación realizada:
+
+```text
+MariaDB   → .sql.gz válido, aproximadamente 694 KiB
+WordPress → .tar.gz válido, aproximadamente 36 MiB
+GCS       → objetos visibles en cloud-1-506415-backups
+```
+
+## Paso 43 — Implementar restore y Disaster Recovery
+
+Se creó `ansible/restore.yml` y el role `restore`. El playbook descarga los
+backups más recientes desde GCS, valida sus formatos y restaura la base de
+datos y los archivos de WordPress en `cloud2`.
+
+La cuenta `cloud1-restore` solo tiene `roles/storage.objectViewer`, por lo que
+la VM de recuperación no puede escribir ni borrar objetos del bucket.
+
+## Paso 44 — Validar restore completo en cloud2
+
+El restore se ejecutó sobre la segunda VM sin tocar la principal. Tras
+restaurar los datos se actualizaron `home` y `siteurl` para la IP de `cloud2`,
+se levantó Compose y se verificó que WordPress recuperó la conexión con
+MariaDB y respondió por HTTPS.
+
+## Paso 45 — Añadir healthchecks de Docker
+
+Compose incorporó healthchecks para MariaDB, WordPress, phpMyAdmin y Nginx.
+Además, cAdvisor quedó integrado como servicio local de observabilidad. La
+cadena de arranque usa `condition: service_healthy` para que WordPress y
+phpMyAdmin esperen a MariaDB, y para que Nginx espere a los servicios web.
+
+## Paso 46 — Instalar Google Cloud Ops Agent con Ansible
+
+Se creó `ansible/monitoring.yml` y el role `monitoring`. Ansible instala el
+Google Cloud Ops Agent, habilita su servicio y configura la recolección de
+métricas Prometheus desde cAdvisor y desde el exporter propio.
+
+Terraform asigna a la identidad de `cloud1` los roles
+`roles/monitoring.metricWriter` y `roles/logging.logWriter`.
+
+## Paso 47 — Crear health checks con Ansible
+
+Se creó `ansible/health.yml` y el role `health`. El chequeo valida contenedores,
+MariaDB, instalación y base de datos de WordPress, HTTPS, uso de disco y uso
+de memoria.
+
+Los límites operativos actuales de disco y memoria son inferiores al 85 %.
+El acceso corto es:
+
+```bash
+make health-cloud1
+```
+
+## Paso 48 — Crear uptime check con Terraform
+
+Terraform creó el uptime check `cloud-1-web-uptime`, asociado a la IP estática
+de `cloud-1-vm`, con comprobación HTTP de `/`, respuesta 2XX y periodo de 60
+segundos.
+
+## Paso 49 — Crear dashboard de Cloud Monitoring con Terraform
+
+Se creó el dashboard `cloud-1-terraform` en `terraform/monitoring.tf`. Incluye
+CPU, memoria usada, disco usado, red, I/O, tablas Running/Healthy y gráficos
+de CPU y memoria por contenedor.
+
+Los filtros de memoria y disco se redujeron a los estados útiles (`used`) y el
+`instance_id` de la VM se referencia dinámicamente desde Terraform.
+
+## Paso 50 — Integrar cAdvisor y métricas Prometheus
+
+cAdvisor se añadió al Compose con el puerto `127.0.0.1:8080:8080` y volúmenes
+del host en solo lectura. Se verificó desde la VM que `/metrics` expone datos
+de CPU, memoria y otros recursos por contenedor.
+
+## Paso 51 — Añadir métricas Running/Healthy por contenedor
+
+Se implementó `docker_health_exporter.py` como un servicio systemd que escucha
+solo en `127.0.0.1:9105`. El exporter consulta `docker inspect` y publica:
+
+```text
+cloud1_container_running
+cloud1_container_healthy
+```
+
+Ops Agent recoge ambas métricas mediante un receiver Prometheus dedicado.
+
+## Paso 52 — Crear y validar alertas Container unhealthy / Container down
+
+Terraform creó y habilitó estas políticas con una duración mínima de 60
+segundos:
+
+```text
+Cloud-1 - Container unhealthy → cloud1_container_healthy == 0
+Cloud-1 - Container down       → cloud1_container_running == 0
+```
+
+La alerta `Container unhealthy` se probó con una alteración temporal y segura
+del exporter sobre cAdvisor, sin detener MariaDB, WordPress ni borrar
+volúmenes. La incidencia se abrió en Cloud Monitoring; después se revirtió la
+prueba y la métrica volvió a `1`.
+
+```mermaid
+timeline
+    title Evolución del proyecto después de la IP estática
+    Paso 41 : IP estática para cloud1
+    Paso 42 : Backups locales y GCS
+    Paso 43 : Restore y Disaster Recovery
+    Paso 44 : Restore probado en cloud2
+    Paso 45 : Healthchecks de Docker
+    Paso 46 : Ops Agent con Ansible
+    Paso 47 : Health check operativo
+    Paso 48 : Uptime check Terraform
+    Paso 49 : Dashboard Terraform
+    Paso 50 : cAdvisor y Prometheus
+    Paso 51 : Exporter Running/Healthy
+    Paso 52 : Alertas probadas
+```
+
 ## Estado actual de las validaciones obligatorias
 
 Las validaciones principales del subject quedaron completadas:
@@ -1526,8 +2029,9 @@ Las validaciones principales del subject quedaron completadas:
 
 ## Estado actual y validaciones pendientes
 
-La automatización principal y las validaciones obligatorias están completadas.
-Quedan como mejoras opcionales backups, monitorización y CI/CD.
+La automatización principal, Disaster Recovery y la observabilidad están
+implementadas y verificadas. CI/CD sigue pendiente como siguiente bloque de
+trabajo.
 
 ---
 
@@ -1543,16 +2047,20 @@ terraform plan
 terraform apply
 ```
 
-## 2. Obtener la IP pública actual
+## 2. Generar el inventory dinámico
 
-Después de arrancar la VM, comprobar la IP actual con `gcloud` y actualizar el
-inventory de Ansible.
-
-Por ejemplo:
+El script consulta directamente la IP NAT de cada VM con
+`gcloud compute instances describe`. No depende de `terraform output -raw` y
+omite una VM que esté apagada o no tenga IP pública disponible.
 
 ```bash
-gcloud compute instances list --project cloud-1-506415
+make inventory
+cat ansible/inventory/hosts.ini
 ```
+
+La IP de `cloud1` es estática; la de `cloud2` es efímera y puede cambiar al
+reiniciar la instancia. El inventory se regenera automáticamente antes de los
+targets de Ansible.
 
 ## 3. Verificar Ansible
 
@@ -1606,7 +2114,10 @@ cloud1_nginx
 cloud1_phpmyadmin
 cloud1_wordpress
 cloud1_mariadb
+cloud1_cadvisor
 ```
+
+`wordpress-cli` pertenece al perfil `cli` y se ejecuta solo bajo demanda.
 
 ## 8. Verificar HTTP/HTTPS
 
@@ -1615,6 +2126,64 @@ curl -I http://IP_VM
 curl -k -I https://IP_VM
 curl -k -I https://IP_VM/phpmyadmin/
 ```
+
+## 9. Ejecutar health checks
+
+```bash
+make health-cloud1
+```
+
+Esto valida el estado de los contenedores, MariaDB, WordPress, HTTPS, disco y
+memoria.
+
+## 10. Ejecutar y verificar backups
+
+```bash
+make backup
+gcloud storage ls -l gs://cloud-1-506415-backups/
+```
+
+El backup se ejecuta sobre `cloud1`, crea un dump de MariaDB y un archivo de
+WordPress, y sube solo los dos archivos nuevos.
+
+## 11. Probar el restore en cloud2
+
+```bash
+make restore
+make ps-cloud2
+make logs-cloud2
+```
+
+El playbook de restore está limitado a `cloud2` y actualiza las URLs de
+WordPress para la IP que tenga esa VM.
+
+## 12. Activar la monitorización
+
+```bash
+make monitoring-cloud1
+```
+
+Para revisar los exporters locales:
+
+```bash
+ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+  -a 'curl -s http://127.0.0.1:8080/metrics | head -30'
+
+ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+  -a 'curl -s http://127.0.0.1:9105/metrics'
+```
+
+## 13. Gestionar Monitoring con Terraform
+
+```bash
+terraform -chdir=terraform fmt
+terraform -chdir=terraform validate
+terraform -chdir=terraform plan
+terraform -chdir=terraform apply
+```
+
+Esto mantiene el uptime check, el dashboard `cloud-1-terraform` y las
+políticas `Container unhealthy` y `Container down`.
 
 ---
 
@@ -1630,6 +2199,7 @@ El `.gitignore` debe excluir al menos:
 application_default_credentials.json
 *.key
 *.pem
+ansible/inventory/hosts.ini
 ```
 
 Nunca deben versionarse:
@@ -1676,7 +2246,7 @@ relevantes son `22`, `80` y `443`.
 | Backend remoto GCS | IMPLEMENTADO/VERIFICADO |
 | VM y firewall 22/80/443 | IMPLEMENTADO/VERIFICADO |
 | Outputs de IP pública de ambas VMs | IMPLEMENTADO/VERIFICADO |
-| Inventory automático desde Terraform | IMPLEMENTADO/VERIFICADO |
+| Inventory dinámico consultando GCP | IMPLEMENTADO/VERIFICADO |
 | SSH parametrizable | IMPLEMENTADO/VERIFICADO |
 | Inventory y conexión SSH | IMPLEMENTADO/VERIFICADO |
 | Role Docker | IMPLEMENTADO/VERIFICADO |
@@ -1707,21 +2277,30 @@ relevantes son `22`, `80` y `443`.
 | Deployment completo desde el contenedor portable | IMPLEMENTADO/VERIFICADO |
 | Idempotencia desde el contenedor portable | IMPLEMENTADO/VERIFICADO |
 | IP estática para `cloud-1-vm` | IMPLEMENTADO/VERIFICADO |
-| Backups | MEJORA FUTURA |
-| Monitorización | MEJORA FUTURA |
+| Bucket GCS de backups con versionado | IMPLEMENTADO/VERIFICADO |
+| Backup automático MariaDB + WordPress | IMPLEMENTADO/VERIFICADO |
+| Restore/Disaster Recovery en `cloud2` | IMPLEMENTADO/VERIFICADO |
+| Docker healthchecks | IMPLEMENTADO/VERIFICADO |
+| Health checks con Ansible | IMPLEMENTADO/VERIFICADO |
+| Google Cloud Ops Agent | IMPLEMENTADO/VERIFICADO |
+| cAdvisor + métricas Prometheus | IMPLEMENTADO/VERIFICADO |
+| Docker Health Exporter propio | IMPLEMENTADO/VERIFICADO |
+| Dashboard Terraform `cloud-1-terraform` | IMPLEMENTADO/VERIFICADO |
+| Uptime check de `cloud-1-vm` | IMPLEMENTADO/VERIFICADO |
+| Cloud Logging centralizado | IMPLEMENTADO/VERIFICADO |
+| Alertas Container unhealthy / Container down | IMPLEMENTADO/VERIFICADO |
 | CI/CD | MEJORA FUTURA |
 
 ---
 
 # Próximos pasos
 
-Los requisitos principales ya están implementados y validados. Las mejoras
-opcionales siguientes quedan fuera del flujo principal:
+Las funcionalidades principales, Disaster Recovery y observabilidad están
+implementadas y verificadas.
 
-1. Añadir backups.
-2. Añadir monitorización.
-3. Añadir CI/CD.
-4. Valorar un gestor de secretos dedicado.
+1. Añadir CI/CD con GitHub Actions.
+2. Valorar un gestor de secretos dedicado.
+3. Valorar TLS con certificado firmado por una CA pública.
 
 ---
 
@@ -1757,13 +2336,22 @@ opcionales siguientes quedan fuera del flujo principal:
 - Profiles de Compose y automatización con WP-CLI.
 - Diagnóstico mediante `docker ps`, logs y `curl`.
 - Despliegue multi-host con Ansible.
+- Backups consistentes de MariaDB y WordPress.
+- Versionado de objetos y permisos IAM en GCS.
+- Separación de identidades de backup y restore.
+- Disaster Recovery y restore validado en una segunda VM.
+- Healthchecks de Docker y condiciones `service_healthy`.
+- Google Cloud Ops Agent y Cloud Logging.
+- Prometheus, cAdvisor y exporters personalizados.
+- Consultas PromQL/PQL para métricas y alertas.
+- Dashboards, uptime checks y políticas de alerting como código.
 - Acceso SSH directo como root mediante clave pública.
 - Diagnóstico de permisos por UID entre contenedores.
 - Validación fresh recreando infraestructura con Terraform.
 - VPC propia, subredes regionales y migración de interfaces de red.
 - Actualizaciones in-place de VMs con `allow_stopping_for_update`.
 - Backend remoto GCS.
-- Inventory automático desde outputs de Terraform.
+- Inventory dinámico consultando directamente GCP.
 - Parametrización de usuario y clave SSH.
 - Contenedor portable de herramientas.
 - Regeneración automática del inventory antes de las operaciones Ansible.
@@ -1813,8 +2401,10 @@ el sistema confíe por defecto.
 Las validaciones principales del subject ya se completaron: fresh deployment,
 WordPress sobre datos nuevos, acceso root y multi-servidor. La IP de la VM
 principal es estática; la segunda VM mantiene una IP efímera, por lo que el
-inventory debe regenerarse si cambia. Además, un gestor de secretos dedicado
-sería una mejora frente al `.env` local ignorado por Git.
+inventory debe regenerarse si cambia. Además, CI/CD y un gestor de secretos
+dedicado serían mejoras frente al flujo actual basado en comandos locales y
+`.env` excluido de Git. El certificado TLS actual es autofirmado; una CA
+pública sería el siguiente paso para clientes externos.
 
 ---
 
@@ -1827,5 +2417,9 @@ https://github.com/Augustojrl92/cloud-1
 Rama actual:
 
 ```text
-portability
+backups
 ```
+
+La documentación refleja el estado implementado hasta el **Paso 52**:
+backups, Disaster Recovery, healthchecks, monitorización y alerting. CI/CD es
+el siguiente bloque de trabajo.
