@@ -23,7 +23,7 @@ HEALTH_PLAYBOOK := $(ANSIBLE_DIR)/health.yml
 	status inventory ping ping-cloud1 ping-cloud2 check-cloud1 check-cloud2 deploy deploy-cloud1 deploy-cloud2 \
 	backup restore monitoring-cloud1 health health-cloud1 \
 	compose-config up down ps ps-cloud1 ps-cloud2 logs logs-cloud1 logs-cloud2 https-cloud1 \
-	tools tools-build
+	tools tools-build test-config test-security test-containers test-orchestration test-website test-idempotency
 
 help:
 	@echo "Cloud-1 commands"
@@ -76,6 +76,12 @@ help:
 	@echo ""
 	@echo "Tools:"
 	@echo "  make tools"
+	@echo "  make test-config"
+	@echo "  make test-security"
+	@echo "  make test-containers"
+	@echo "  make test-orchestration"
+	@echo "  make test-website"
+	@echo "  make test-idempotency"
 
 tf-init:
 	cd terraform && terraform init
@@ -221,3 +227,129 @@ tools: tools-build
 		          chmod 600 /root/.ssh/google_compute_engine && \
 		          chmod 644 /root/.ssh/google_compute_engine.pub && \
 		          exec bash'
+
+test-config:
+	@echo "== Terraform validate =="
+	terraform -chdir=terraform validate
+
+	@echo "== Ansible syntax check =="
+	ansible-playbook -i ansible/inventory/hosts.ini ansible/playbook.yml --syntax-check
+	ansible-playbook -i ansible/inventory/hosts.ini ansible/backup.yml --syntax-check
+	ansible-playbook -i ansible/inventory/hosts.ini ansible/restore.yml --syntax-check
+	ansible-playbook -i ansible/inventory/hosts.ini ansible/monitoring.yml --syntax-check
+	ansible-playbook -i ansible/inventory/hosts.ini ansible/health.yml --syntax-check
+
+	@echo "== Configuration tests OK =="
+
+test-security:
+	@echo "== Secrets management =="
+	@if git ls-files docker/.env | grep -q .; then \
+		echo "ERROR: docker/.env esta versionado"; \
+		exit 1; \
+	else \
+		echo "OK: docker/.env no esta versionado"; \
+	fi
+
+	@echo "== Database exposure =="
+	@if grep -A 20 '^  mariadb:' docker/docker-compose.yml | grep -q '3306:3306'; then \
+		echo "ERROR: MariaDB publica 3306"; \
+		exit 1; \
+	else \
+		echo "OK: MariaDB no publica 3306"; \
+	fi
+
+	@echo "== WordPress exposure =="
+	@if grep -A 25 '^  wordpress:' docker/docker-compose.yml | grep -qE '^[[:space:]]*-[[:space:]]*"?[0-9]+:[0-9]+'; then \
+		echo "ERROR: WordPress publica un puerto al host"; \
+		exit 1; \
+	else \
+		echo "OK: WordPress no publica puertos al host"; \
+	fi
+
+	@echo "== phpMyAdmin exposure =="
+	@if grep -A 25 '^  phpmyadmin:' docker/docker-compose.yml | grep -qE '^[[:space:]]*-[[:space:]]*"?[0-9]+:[0-9]+'; then \
+		echo "ERROR: phpMyAdmin publica un puerto al host"; \
+		exit 1; \
+	else \
+		echo "OK: phpMyAdmin no publica puertos al host"; \
+	fi
+
+	@echo "== Nginx web ports =="
+	@grep -A 30 '^  nginx:' docker/docker-compose.yml | grep -q '80:80' || { echo "ERROR: Nginx no publica 80"; exit 1; }
+	@grep -A 30 '^  nginx:' docker/docker-compose.yml | grep -q '443:443' || { echo "ERROR: Nginx no publica 443"; exit 1; }
+
+	@echo "== Security tests OK =="
+
+test-containers: inventory
+	@echo "== Required containers =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker ps --format "{% raw %}{{.Names}}{% endraw %}" | grep -q "^cloud1_mariadb$$"'
+
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker ps --format "{% raw %}{{.Names}}{% endraw %}" | grep -q "^cloud1_wordpress$$"'
+
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker ps --format "{% raw %}{{.Names}}{% endraw %}" | grep -q "^cloud1_phpmyadmin$$"'
+
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker ps --format "{% raw %}{{.Names}}{% endraw %}" | grep -q "^cloud1_nginx$$"'
+
+	@echo "== Persistent volumes =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker volume ls | grep -q "mariadb_data"'
+
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker volume ls | grep -q "wordpress_data"'
+
+	@echo "== Docker network =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker network ls | grep -q "cloud1_network"'
+
+	@echo "== Containers tests OK =="
+
+test-orchestration: inventory
+	@echo "== Docker Compose stack =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'cd /opt/cloud-1 && docker compose ps'
+
+	@echo "== Restart Nginx independently =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'cd /opt/cloud-1 && docker compose restart nginx'
+
+	@echo "== Verify Nginx after restart =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'sleep 3 && curl -kfsS https://127.0.0.1/ >/dev/null'
+
+	@echo "== Orchestration tests OK =="
+
+test-website: inventory
+	@echo "== WordPress local HTTPS =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'curl -kfsS -o /dev/null -w "%{http_code}\n" https://127.0.0.1/ | grep -q "^200$$"'
+
+	@echo "== Multiple requests =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'for i in 1 2 3 4 5; do curl -kfsS https://127.0.0.1/ >/dev/null || exit 1; done'
+
+	@echo "== WordPress installation =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'cd /opt/cloud-1 && docker compose --profile cli run --rm wordpress-cli wp core is-installed'
+
+	@echo "== Website tests OK =="
+
+test-idempotency: inventory
+	@echo "== First deployment =="
+	ansible-playbook -i ansible/inventory/hosts.ini ansible/playbook.yml --limit cloud1
+
+	@echo "== Second deployment =="
+	ansible-playbook -i ansible/inventory/hosts.ini ansible/playbook.yml --limit cloud1
+
+	@echo "== Verify application after second deployment =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'curl -kfsS https://127.0.0.1/ >/dev/null'
+
+	@echo "== Verify container health =="
+	ansible cloud1 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker ps --format "{% raw %}{{.Names}} {{.Status}}{% endraw %}"'
+
+	@echo "== Idempotency test OK =="
