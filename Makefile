@@ -20,10 +20,11 @@ HEALTH_PLAYBOOK := $(ANSIBLE_DIR)/health.yml
 .PHONY: help \
 	tf-init tf-validate tf-plan tf-apply \
 	vm-start vm-stop vm-start-2 vm-stop-2 vm-start-all vm-stop-all vm-status \
-	status inventory ping ping-cloud1 ping-cloud2 check-cloud1 check-cloud2 deploy deploy-cloud1 deploy-cloud2 \
+	destroy-cloud2 recreate-cloud2 \
+	status inventory ping ping-cloud1 ping-cloud2 check-cloud1 check-cloud2 deploy deploy-cloud1 deploy-cloud2 test-deployment \
 	backup restore monitoring-cloud1 health health-cloud1 \
 	compose-config up down ps ps-cloud1 ps-cloud2 logs logs-cloud1 logs-cloud2 https-cloud1 \
-	tools tools-build test-config test-security test-containers test-orchestration test-website test-idempotency
+	tools tools-build evaluation test-config test-security test-containers test-container-best-practices test-orchestration test-website test-idempotency
 
 help:
 	@echo "Cloud-1 commands"
@@ -43,6 +44,8 @@ help:
 	@echo "  make vm-stop-all"
 	@echo "  make vm-status"
 	@echo "  make status"
+	@echo "  make destroy-cloud2"
+	@echo "  make recreate-cloud2"
 	@echo ""
 	@echo "Ansible:"
 	@echo "  make inventory"
@@ -52,10 +55,13 @@ help:
 	@echo "  make deploy"
 	@echo "  make deploy-cloud1"
 	@echo "  make deploy-cloud2"
+	@echo "  make test-deployment"
 	@echo ""
 	@echo "Backups:"
 	@echo "  make backup"
 	@echo "  make restore"
+	@echo ""
+	@echo "Observability:"
 	@echo "  make monitoring-cloud1"
 	@echo ""
 	@echo "Health:"
@@ -79,9 +85,11 @@ help:
 	@echo "  make test-config"
 	@echo "  make test-security"
 	@echo "  make test-containers"
+	@echo "  make test-container-best-practices"
 	@echo "  make test-orchestration"
 	@echo "  make test-website"
 	@echo "  make test-idempotency"
+	@echo "  make evaluation"
 
 tf-init:
 	cd terraform && terraform init
@@ -94,6 +102,12 @@ tf-plan:
 
 tf-apply:
 	cd terraform && terraform apply
+
+destroy-cloud2:
+	terraform -chdir=terraform destroy -target=google_compute_instance.cloud1_vm_2
+
+recreate-cloud2:
+	terraform -chdir=terraform apply -target=google_compute_instance.cloud1_vm_2
 
 vm-start:
 	gcloud compute instances start $(VM_NAME) \
@@ -159,6 +173,30 @@ deploy-cloud1: inventory
 
 deploy-cloud2: inventory
 	ansible-playbook -i $(INVENTORY) $(PLAYBOOK) --limit cloud2
+
+test-deployment: inventory
+	@echo "== Check cloud2 availability =="
+	@grep -q '^cloud2 ' ansible/inventory/hosts.ini || { \
+		echo "ERROR: cloud2 no esta disponible en el inventario"; \
+		exit 1; \
+	}
+
+	@echo "== Deploy to cloud2 =="
+	ansible-playbook -i ansible/inventory/hosts.ini ansible/playbook.yml --limit cloud2
+
+	@echo "== Verify HTTPS on cloud2 =="
+	ansible cloud2 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'curl -kfsS https://127.0.0.1/ >/dev/null'
+
+	@echo "== Verify WordPress installation on cloud2 =="
+	ansible cloud2 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'cd /opt/cloud-1 && docker compose --profile cli run --rm wordpress-cli wp core is-installed --path=/var/www/html --allow-root'
+
+	@echo "== Verify containers on cloud2 =="
+	ansible cloud2 -i ansible/inventory/hosts.ini -b -m shell \
+		-a 'docker ps --format "{% raw %}{{.Names}} {{.Status}}{% endraw %}"'
+
+	@echo "== Deployment test OK =="
 
 backup: inventory
 	ansible-playbook -i $(INVENTORY) $(BACKUP_PLAYBOOK)
@@ -228,6 +266,15 @@ tools: tools-build
 		          chmod 644 /root/.ssh/google_compute_engine.pub && \
 		          exec bash'
 
+evaluation:
+	$(MAKE) test-config
+	$(MAKE) test-security
+	$(MAKE) test-containers
+	$(MAKE) test-orchestration
+	$(MAKE) test-website
+	$(MAKE) test-idempotency
+	$(MAKE) test-container-best-practices
+
 test-config:
 	@echo "== Terraform validate =="
 	terraform -chdir=terraform validate
@@ -279,6 +326,63 @@ test-security:
 	@grep -A 30 '^  nginx:' docker/docker-compose.yml | grep -q '443:443' || { echo "ERROR: Nginx no publica 443"; exit 1; }
 
 	@echo "== Security tests OK =="
+
+test-container-best-practices:
+	@echo "== Official images =="
+	@grep -q 'image: mariadb:' docker/docker-compose.yml || { \
+		echo "ERROR: MariaDB no usa una imagen declarada"; \
+		exit 1; \
+	}
+	@grep -q 'image: wordpress:' docker/docker-compose.yml || { \
+		echo "ERROR: WordPress no usa una imagen declarada"; \
+		exit 1; \
+	}
+	@grep -q 'image: phpmyadmin:' docker/docker-compose.yml || { \
+		echo "ERROR: phpMyAdmin no usa una imagen declarada"; \
+		exit 1; \
+	}
+	@grep -q 'image: nginx:' docker/docker-compose.yml || { \
+		echo "ERROR: Nginx no usa una imagen declarada"; \
+		exit 1; \
+	}
+
+	@echo "== No unnecessary custom builds =="
+	@if grep -qE '^[[:space:]]*build:' docker/docker-compose.yml; then \
+		echo "INFO: hay builds custom; revisar Dockerfiles"; \
+	else \
+		echo "OK: se usan imagenes preconstruidas"; \
+	fi
+
+	@echo "== Restart policies =="
+	@grep -q 'restart: unless-stopped' docker/docker-compose.yml || { \
+		echo "ERROR: faltan restart policies"; \
+		exit 1; \
+	}
+
+	@echo "== Healthchecks =="
+	@grep -q 'healthcheck:' docker/docker-compose.yml || { \
+		echo "ERROR: no hay healthchecks"; \
+		exit 1; \
+	}
+
+	@echo "== Persistent volumes =="
+	@grep -q 'mariadb_data:' docker/docker-compose.yml || { \
+		echo "ERROR: falta volumen de MariaDB"; \
+		exit 1; \
+	}
+	@grep -q 'wordpress_data:' docker/docker-compose.yml || { \
+		echo "ERROR: falta volumen de WordPress"; \
+		exit 1; \
+	}
+
+	@echo "== Image tags =="
+	@if grep -E '^[[:space:]]*image:.*:latest$$' docker/docker-compose.yml; then \
+		echo "WARNING: hay imagenes con :latest; funciona, pero reduce reproducibilidad"; \
+	else \
+		echo "OK: imagenes versionadas"; \
+	fi
+
+	@echo "== Container best-practices tests OK =="
 
 test-containers: inventory
 	@echo "== Required containers =="
