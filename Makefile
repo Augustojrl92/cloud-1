@@ -3,6 +3,10 @@ ZONE := us-central1-c
 VM_NAME := cloud-1-vm
 VM_NAME_2 := cloud-1-vm-2
 
+# Keep Terraform providers and internal state off the Windows bind mount.
+TF_DATA_DIR := /tmp/cloud1-terraform-data
+export TF_DATA_DIR
+
 ifeq ($(OS),Windows_NT)
 GCLOUD_CONFIG := $(APPDATA)/gcloud
 else
@@ -276,6 +280,9 @@ evaluation:
 	$(MAKE) test-container-best-practices
 
 test-config:
+	@echo "== Terraform init =="
+	terraform -chdir=terraform init -backend=false
+
 	@echo "== Terraform validate =="
 	terraform -chdir=terraform validate
 
