@@ -1,0 +1,43 @@
+name: Cloud-1 CI
+
+on:
+  push:
+    branches:
+      - ci-tests
+
+  pull_request:
+    branches:
+      - ci-tests
+
+jobs:
+  validation:
+    name: Static validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Cloud-1 tools
+        run: docker build -t cloud1-tools -f tools/Dockerfile .
+
+      - name: Terraform and Ansible validation
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            cloud1-tools \
+            make test-config
+
+      - name: Security tests
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            cloud1-tools \
+            make test-security
+
+      - name: Container best-practices tests
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            cloud1-tools \
+            make test-container-best-practices
